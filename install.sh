@@ -345,10 +345,10 @@ echo "Kubernetes cluster version: $checkK8sVersion"
 k8sVersion114Validate=`echo -n $checkK8sVersion | grep -E '1.14.x'`
 k8sVersion115Validate=`echo -n $checkK8sVersion | grep -E '1.15.x'`
 k8sVersion116Validate=`echo -n $checkK8sVersion | grep -E '1.16.x'`
-if [[ ${k8sVersion114Validate} || ${k8sVersion115Validate} || ${k8sVersion116Validate} ]]; then
+if [[ -z ${k8sVersion114Validate} || -z ${k8sVersion115Validate} || -z ${k8sVersion116Validate} ]]; then
   echo "Warning: PX-Central supports following k8s versions : 1.14.x, 1.15.x and 1.16.x"
   echo ""
-  usage
+  exit 1
 fi
 
 if [ -z ${PXCINPUTENDPOINT} ]; then
