@@ -1294,9 +1294,15 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
     pxcGrafanaEndpoint=$PXENDPOINT
   else
     OIDCENDPOINT=$PXENDPOINT:$PXC_KEYCLOAK_HTTP_PORT
-    OIDC_REDIRECT_URL=$PXENDPOINT:$PXC_UI_EXTERNAL_PORT
-    pxcGrafanaEndpoint=$PXENDPOINT:$PXC_UI_EXTERNAL_PORT
+    OIDC_REDIRECT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+    pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
   fi
+fi
+
+if [ "$OIDCENABLED" == "false" ]; then
+  OIDC_REDIRECT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+  pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+  echo "External Endpoint: $OIDC_REDIRECT_URL"
 fi
 
 if [[ "$OIDCENABLED" == "true" &&  "$PX_BACKUP_DEPLOY" == "true" ]]; then
