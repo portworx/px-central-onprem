@@ -1044,7 +1044,12 @@ if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
         ingresscheck="1"
         break
       fi
-      showMessage "Waiting for PX-Central-Onprem hostname."
+      ingressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found"`
+      if [ ${ingressIPEndpoint} ]; then
+        ingresscheck="1"
+        break
+      fi
+      showMessage "Waiting for PX-Central-Onprem endpoint"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
@@ -1054,9 +1059,13 @@ if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
         exit 1
       fi
     done
-  echo "PX-Central-Onprem Host Name: $ingressEndpoint"
-  PXCINPUTENDPOINT=$ingressEndpoint
+  if [ ${ingressEndpoint} ]; then
+    PXCINPUTENDPOINT=$ingressEndpoint
+  else
+    PXCINPUTENDPOINT=$ingressIPEndpoint
+  fi
   INGRESS_ENDPOINT=$PXCINPUTENDPOINT
+  echo "PX-Central-Onprem Endpont: $INGRESS_ENDPOINT"
 fi
 
 if [ -z ${PXCINPUTENDPOINT} ]; then
@@ -1274,22 +1283,21 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
 
   OIDCCLIENTID=$PXC_OIDC_CLIENT_ID
   OIDCSECRET="dummy"
-  grafanaEndpoint=""
+  pxcGrafanaEndpoint=""
   if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
     OIDCENDPOINT=$PXC_KEYCLOAK
     OIDC_REDIRECT_URL=$PXC_FRONTEND
-    grafanaEndpoint=$PXC_GRAFANA
+    pxcGrafanaEndpoint=$PXC_GRAFANA
   elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
     OIDCENDPOINT="$PXENDPOINT/keycloak"
     OIDC_REDIRECT_URL="$PXENDPOINT"
-    grafanaEndpoint=$PXENDPOINT
+    pxcGrafanaEndpoint=$PXENDPOINT
   else
-    OIDCENDPOINT="$PXENDPOINT:$PXC_KEYCLOAK_HTTP_PORT"
-    OIDC_REDIRECT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
-    grafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+    OIDCENDPOINT=$PXENDPOINT:$PXC_KEYCLOAK_HTTP_PORT
+    OIDC_REDIRECT_URL=$PXENDPOINT:$PXC_UI_EXTERNAL_PORT
+    pxcGrafanaEndpoint=$PXENDPOINT:$PXC_UI_EXTERNAL_PORT
   fi
 fi
-echo "Grafana endpoint: $grafanaEndpoint"
 
 if [[ "$OIDCENABLED" == "true" &&  "$PX_BACKUP_DEPLOY" == "true" ]]; then
   oidc_endpoint="http://$OIDCENDPOINT/auth/realms/master"
@@ -2379,7 +2387,7 @@ spec:
       externalEndpoint: '$METRICS_ENDPOINT'
     grafana:
       enabled: '$PX_METRICS_DEPLOY'
-      endpoint: '$grafanaEndpoint'
+      endpoint: '$pxcGrafanaEndpoint'
   frontendEndpoint: '$PXC_FRONTEND'
   backendEndpoint: '$PXC_BACKEND'
   middlewareEndpoint: '$PXC_MIDDLEWARE'
