@@ -1033,7 +1033,7 @@ if [ ${PXCINPUTENDPOINT} ]; then
 fi
 
 if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-  kubectl apply -f $pxc_ingress --namespace $PXCNAMESPACE &>/dev/null
+  kubectl --kubeconfig=$KC apply -f $pxc_ingress --namespace $PXCNAMESPACE &>/dev/null
   sleep $SLEEPINTERVAL
   ingresscheck="0"
   timecheck=0
@@ -1217,7 +1217,7 @@ if [ "$PXCNAMESPACE" != "$PX_SECRET_NAMESPACE" ]; then
 fi
 
 if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
-  kubectl apply -f $pxc_domain --namespace $PXCNAMESPACE &>/dev/null
+  kubectl --kubeconfig=$KC apply -f $pxc_domain --namespace $PXCNAMESPACE &>/dev/null
 fi
 
 if [ "$CLOUD_STORAGE_ENABLED" == "true" ]; then
@@ -1283,7 +1283,7 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
 
   OIDCCLIENTID=$PXC_OIDC_CLIENT_ID
   OIDCSECRET="dummy"
-  pxcGrafanaEndpoint=""
+  pxcGrafanaEndpoint="http://pxc-grafana.portworx.svc.cluster.local:3000/grafana"
   if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
     OIDCENDPOINT=$PXC_KEYCLOAK
     OIDC_REDIRECT_URL=$PXC_FRONTEND
@@ -1468,6 +1468,10 @@ if [ "$PXDAEMONSETDEPLOYMENT" == "true" ]; then
   echo "PX daemonset deployment: $PXDAEMONSETDEPLOYMENT"
 elif [ "$PXOPERATORDEPLOYMENT" == "true" ]; then
   echo "PX operator deployment: $PXOPERATORDEPLOYMENT"
+fi
+
+if [ "$PXCENTRAL_MINIK8S"  == "false" ]; then
+  PX_STORE_DEPLOY="true"
 fi
 
 if [ "$ISOPENSHIFTCLUSTER" == "true" ]; then
@@ -3008,6 +3012,7 @@ data:
   APP_NAME: Portworx
   BACKEND_HOSTNAME: '$PXENDPOINT':'$PXC_UI_EXTERNAL_PORT'/backend
   FRONTEND_HOSTNAME: '$PXENDPOINT':'$PXC_UI_EXTERNAL_PORT'/pxcentral
+  FRONTEND_GRAFANA_URL: "http://'$pxcGrafanaEndpoint'/grafana"           # grafana url
   BROADCAST_DRIVER: log
   CACHE_DRIVER: file
   DB_CONNECTION: mysql
@@ -3058,6 +3063,7 @@ data:
   APP_NAME: Portworx
   BACKEND_HOSTNAME: '$PXC_BACKEND'
   FRONTEND_HOSTNAME: '$PXC_FRONTEND'
+  FRONTEND_GRAFANA_URL: http://'$pxcGrafanaEndpoint'           # grafana url
   BROADCAST_DRIVER: log
   CACHE_DRIVER: file
   DB_CONNECTION: mysql
@@ -3108,6 +3114,7 @@ data:
   APP_NAME: Portworx
   BACKEND_HOSTNAME: '$INGRESS_ENDPOINT'/backend
   FRONTEND_HOSTNAME: '$INGRESS_ENDPOINT'/pxcentral
+  FRONTEND_GRAFANA_URL: http://'$pxcGrafanaEndpoint'/grafana
   BROADCAST_DRIVER: log
   CACHE_DRIVER: file
   DB_CONNECTION: mysql
@@ -3163,7 +3170,7 @@ data:
     [users]
     auto_assign_org_role = Admin
     [server]
-    domain = '$grafanaEndpoint'
+    domain = '$pxcGrafanaEndpoint'
     root_url = "%(protocol)s://%(domain)s/"
     enforce_domain = false
 
@@ -3179,7 +3186,7 @@ data:
     auth_url= http://'$OIDCENDPOINT'/auth/realms/master/protocol/openid-connect/auth 
     token_url= http://'$OIDCENDPOINT'/auth/realms/master/protocol/openid-connect/token 
     api_url= http://'$OIDCENDPOINT'/auth/realms/master/protocol/openid-connect/userinfo 
-    redirect_uri= http://'$grafanaEndpoint'/login/generic_oauth
+    redirect_uri= http://'$pxcGrafanaEndpoint'/login/generic_oauth
     allowed_domains= 
     allow_sign_up= true
 ' > $grafana_config
@@ -3230,6 +3237,7 @@ while [ $deploymentready -ne "1" ]
 
 showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Operator-- to be ready (5/7)"
 if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
+  kubectl --kubeconfig=$KC create secret generic $BACKUP_OIDC_ADMIN_SECRET_NAME --from-literal=PX_BACKUP_ORG_TOKEN=$OIDC_USER_ACCESS_TOKEN --namespace $PX_BACKUP_NAMESPACE &>/dev/null
   backupready="0"
   timecheck=0
   count=0
@@ -3256,11 +3264,10 @@ if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
         exit 1
       fi
     done
-  backup_pod=`kubectl get po --namespace $PXCNAMESPACE 2>&1 | grep px-backup | awk '{print $1}' 2>&1`
+  backup_pod=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE 2>&1 | grep px-backup | awk '{print $1}' 2>&1`
   if [ "$OIDCENABLED" == "false" ]; then
     kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl create organization --name $PX_BACKUP_ORGANIZATION" &>/dev/null
   else
-    kubectl --kubeconfig=$KC create secret generic $BACKUP_OIDC_ADMIN_SECRET_NAME --from-literal=PX_BACKUP_ORG_TOKEN=$OIDC_USER_ACCESS_TOKEN --namespace $PX_BACKUP_NAMESPACE &>/dev/null
     kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl create organization --name $PX_BACKUP_ORGANIZATION --authtoken $OIDC_USER_ACCESS_TOKEN" &>/dev/null
   fi
 fi
@@ -3424,7 +3431,7 @@ else
     if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
       echo "Keycloak Endpoint: http://$OIDCENDPOINT"
     elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-      echo "Keycloak Endpoint: http://$OIDCENDPOINT/keycloak/auth"
+      echo "Keycloak Endpoint: http://$OIDCENDPOINT"
     else
       echo "Keycloak Endpoint: http://$OIDCENDPOINT/auth"
     fi
