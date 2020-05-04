@@ -423,6 +423,7 @@ STANDARD_NAMESPACE="kube-system"
 CENTRAL_DEPLOYED_PX="false"
 CLOUD_STORAGE_ENABLED="false"
 
+
 start_time=`date +%s`
 if [[ ${PXCENTRAL_MINIK8S} && "$PXCENTRAL_MINIK8S" == "true" ]]; then
   PX_BACKUP_DEPLOY="true"
@@ -657,13 +658,26 @@ spec:
           serviceName: pxc-grafana
           servicePort: 3000
         path: /grafana(/|$)(.*)
+' > $pxc_ingress
+
+pxc_keycloak_ingress="/tmp/pxc_keycloak_ingress.yaml"
+cat <<< '
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: nginx
+  name: pxc-onprem-central-keycloak-ingress
+  namespace: '$PXCNAMESPACE'
+spec:
+  rules:
   - http:
       paths:
       - backend:
           serviceName: pxc-keycloak-http
           servicePort: 80
-        path: /keycloak(/|$)(.*)
-' > $pxc_ingress
+        path: /keycloak
+' > $pxc_keycloak_ingress
 
 if [[ ${PKS_CLUSTER} && "$PKS_CLUSTER" == "true" ]]; then
   PKS_CLUSTER_ENABLED="true"
@@ -727,30 +741,16 @@ else
     usage
     exit 1
   fi
-
-  if [ -z ${ADMINUSER} ]; then
-    echo "ERROR: OIDC admin user name is required"
-    echo ""
-    usage
-    exit 1
-  fi
-
-  if [ -z ${ADMINPASSWORD} ]; then
-    echo "ERROR: OIDC admin user password is required"
-    echo ""
-    usage
-    exit 1
-  fi
-
-  if [ -z ${ADMINEMAIL} ]; then
-    echo "ERROR: OIDC admin user email is required"
-    echo ""
-    usage
-    exit 1
+  keycloak_endpoint=$OIDCENDPOINT
+  auth_substring='/'
+  if [[ "$keycloak_endpoint" == *"$auth_substring"* ]]; then
+    OIDCENDPOINT=$OIDCENDPOINT
+  else
+    OIDCENDPOINT="$OIDCENDPOINT/auth"
   fi
 fi
 
-if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
+if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "true" ]]; then
   if [ -z ${ADMINUSER} ]; then
     echo "ERROR: OIDC admin user name is required"
     echo ""
@@ -774,7 +774,7 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
 fi
 
 if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "false" && "$PX_BACKUP_DEPLOY" == "true" ]]; then
-  OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$OIDCCLIENTID&username=$ADMINUSER&password=$ADMINPASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/auth/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
+  OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$OIDCCLIENTID&username=$ADMINUSER&password=$ADMINPASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
   if [[ -z ${OIDC_USER_ACCESS_TOKEN} && "$OIDC_USER_ACCESS_TOKEN" == "null" ]]; then
       echo "ERROR: Failed to fetch OIDC user [$ADMINUSER] access token which is required to create organization in PX-Backup"
       echo "Specify with flag : --oidc-user-access-token <OIDC_USER_ACCESS_TOKEN>"
@@ -1028,24 +1028,26 @@ if [ "$DOMAIN_SETUP_REQUIRED" = "true" ]; then
   PXCINPUTENDPOINT=$PXC_FRONTEND
 fi
 
-if [ ${PXCINPUTENDPOINT} ]; then
+if [[ ${PXCINPUTENDPOINT} || "$CLOUDPLATFORM" == "$VSPHERE_PROVIDER" ]]; then
   INGRESS_SETUP_REQUIRED="false"
 fi
 
 if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
   kubectl --kubeconfig=$KC apply -f $pxc_ingress --namespace $PXCNAMESPACE &>/dev/null
-  sleep $SLEEPINTERVAL
+  kubectl --kubeconfig=$KC apply -f $pxc_keycloak_ingress --namespace $PXCNAMESPACE &>/dev/null
+  sleep 10
   ingresscheck="0"
   timecheck=0
   while [ $ingresscheck -ne "1" ]
     do
-      ingressEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found"`
-      if [ ${ingressEndpoint} ]; then
+      ingressHostEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found"`
+      ingressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found"`
+      keycloakIngressHostEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-keycloak-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found"`
+      keycloakIngressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-keycloak-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found"`
+      if [[ ${ingressHostEndpoint} && ${keycloakIngressHostEndpoint} ]]; then
         ingresscheck="1"
         break
-      fi
-      ingressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found"`
-      if [ ${ingressIPEndpoint} ]; then
+      elif [[ ${ingressIPEndpoint} && ${keycloakIngressIPEndpoint} ]]; then
         ingresscheck="1"
         break
       fi
@@ -1059,13 +1061,17 @@ if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
         exit 1
       fi
     done
-  if [ ${ingressEndpoint} ]; then
-    PXCINPUTENDPOINT=$ingressEndpoint
-  else
+  if [[ ${ingressHostEndpoint} && ${keycloakIngressHostEndpoint} ]]; then
+    PXCINPUTENDPOINT=$ingressHostEndpoint
+    OIDCENDPOINT="$keycloakIngressHostEndpoint/keycloak"
+  elif [[ ${ingressIPEndpoint} && ${keycloakIngressIPEndpoint} ]]; then
     PXCINPUTENDPOINT=$ingressIPEndpoint
+    OIDCENDPOINT="$keycloakIngressIPEndpoint/keycloak"
   fi
   INGRESS_ENDPOINT=$PXCINPUTENDPOINT
+  KEYCLOAK_INGRESS_ENDPOINT=$OIDCENDPOINT
   echo "PX-Central-Onprem Endpont: $INGRESS_ENDPOINT"
+  echo "PX-Central-Onprem Keycloak Endpont: $KEYCLOAK_INGRESS_ENDPOINT"
 fi
 
 if [ -z ${PXCINPUTENDPOINT} ]; then
@@ -1285,28 +1291,32 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
   OIDCSECRET="dummy"
   pxcGrafanaEndpoint="http://pxc-grafana.portworx.svc.cluster.local:3000/grafana"
   if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
-    OIDCENDPOINT=$PXC_KEYCLOAK
-    OIDC_REDIRECT_URL=$PXC_FRONTEND
+    OIDCENDPOINT="$PXC_KEYCLOAK/auth"
+    EXTERNAL_ENDPOINT_URL=$PXC_FRONTEND
     pxcGrafanaEndpoint=$PXC_GRAFANA
   elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-    OIDCENDPOINT="$PXENDPOINT/keycloak"
-    OIDC_REDIRECT_URL="$PXENDPOINT"
+    EXTERNAL_ENDPOINT_URL="$PXENDPOINT"
     pxcGrafanaEndpoint=$PXENDPOINT
   else
-    OIDCENDPOINT=$PXENDPOINT:$PXC_KEYCLOAK_HTTP_PORT
-    OIDC_REDIRECT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+    OIDCENDPOINT="$PXENDPOINT:$PXC_KEYCLOAK_HTTP_PORT/auth"
+    EXTERNAL_ENDPOINT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
     pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
   fi
 fi
 
 if [ "$OIDCENABLED" == "false" ]; then
-  OIDC_REDIRECT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+  EXTERNAL_ENDPOINT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
   pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
-  echo "External Endpoint: $OIDC_REDIRECT_URL"
+  echo "External Endpoint: $EXTERNAL_ENDPOINT_URL"
+elif [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "false" ]]; then
+  EXTERNAL_ENDPOINT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+  pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+  echo "External Endpoint: $EXTERNAL_ENDPOINT_URL"
 fi
 
 if [[ "$OIDCENABLED" == "true" &&  "$PX_BACKUP_DEPLOY" == "true" ]]; then
-  oidc_endpoint="http://$OIDCENDPOINT/auth/realms/master"
+  echo "External Access OIDC Endpoint: $OIDCENDPOINT"
+  oidc_endpoint="http://$OIDCENDPOINT/realms/master"
   kubectl --kubeconfig=$KC create secret generic $BACKUP_OIDC_SECRET_NAME --from-literal=OIDC_CLIENT_ID=$OIDCCLIENTID --from-literal=OIDC_ENDPOINT=$oidc_endpoint --namespace $PXCNAMESPACE &>/dev/null
   backupsecretcheck="0"
   timecheck=0
@@ -1440,10 +1450,28 @@ central_px=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXC
 existing_px=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.existingpx} 2>&1`
 daemonset_px=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.daemonsetpx} 2>&1`
 operator_px=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.operatorpx} 2>&1`
-
+metrics_store_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.metrics} 2>&1`
+license_server_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.licenseserver} 2>&1`
+if [ "$central_px" == "true" ]; then
+  existingpx="false"
+fi
+if [ "$existingpx" == "true" ]; then
+  central_px="false"
+fi
 config_check=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE 2>&1 | grep -v "error" | grep -v "NotFound" | grep -v "No resources found" | grep -v NAME | awk '{print $1}' | wc -l 2>&1`
+if [[ "$metrics_store_enabled" == "false" && "$PX_METRICS_DEPLOY" == "true" ]]; then
+  config_check=0
+fi
+if [[ "$license_server_enabled" == "false" && "$PX_LICENSE_SERVER_DEPLOY" == "true" ]]; then
+  config_check=0
+fi
 if [ $config_check -eq 0 ]; then
   kubectl --kubeconfig=$KC apply -f $modules_config --namespace $PXCNAMESPACE &>/dev/null
+  if [[ "$license_server_enabled" == "false" && "$PX_LICENSE_SERVER_DEPLOY" == "true" ]]; then
+    kubectl --kubeconfig=$KC delete job pxc-pre-setup --namespace $PXCNAMESPACE &>/dev/null
+    sleep $SLEEPINTERVAL
+    kubectl --kubeconfig=$KC delete job pxc-ls-ha-setup --namespace $PXCNAMESPACE &>/dev/null
+  fi
 else
   if [[ "$central_px" == "true" && "$daemonset_px" == "true" ]]; then
     PXDAEMONSETDEPLOYMENT="true"
@@ -2349,7 +2377,7 @@ spec:
     enabled: '$PX_LIGHTHOUSE_DEPLOY'
     externalHttpPort: '$PXC_LIGHTHOUSE_HTTP_PORT'
     externalHttpsPort: '$PXC_LIGHTHOUSE_HTTPS_PORT'
-  externalEndpoint: '$OIDC_REDIRECT_URL'       # For ingress endpint only
+  externalEndpoint: '$EXTERNAL_ENDPOINT_URL'       # For ingress endpint only
   loadBalancerEndpoint: '$PXENDPOINT'
   username: '$ADMINUSER'                       
   password: '$ADMINPASSWORD'
@@ -2624,7 +2652,7 @@ if [[ "$PX_LICENSE_SERVER_DEPLOY" == "true" || "$PX_STORE_DEPLOY" == "true" ]]; 
     do
       if [ "$PX_STORE_DEPLOY" == "true" ]; then
         pxready=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE -lname=portworx 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
-        if [ "$pxready" -ge "3" ]; then
+        if [ $pxready -ge 3 ]; then
             pxready="1"
             break
         fi
@@ -2754,10 +2782,26 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
         exit 1
       fi
     done
+    if [ ${CLOUDPLATFORM} ]; then
+      echo ""
+      echo "Cloud platform : $CLOUDPLATFORM, ingress setup required: $INGRESS_SETUP_REQUIRED"
+      if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
+        echo "Ingress setup required"
+        if [[ "$CLOUDPLATFORM" == "$GOOGLE_PROVIDER" || "$CLOUDPLATFORM" == "$AZURE_PROVIDER" ]]; then
+          keycloakPodName=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lapp.kubernetes.io/name=keycloak 2>&1 | grep -v NAME | awk '{print $1}'`
+          echo "Keycloak pod: $keycloakPodName"
+          if [ ${keycloakPodName} ]; then
+            kubectl --kubeconfig=$KC exec -it $keycloakPodName --namespace $PXCNAMESPACE -- bash -c "cd /opt/jboss/keycloak/bin/ && ./kcadm.sh config credentials --server http://localhost:8080/keycloak --realm master --user $KEYCLOAK_FRONTEND_USERNAME --password $KEYCLOAK_FRONTEND_PASSWORD && ./kcadm.sh update realms/master -s sslRequired=NONE"
+            echo "Disabled ssl-required"
+            echo ""
+          fi
+        fi
+      fi
+    fi
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
-    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/auth/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
+    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
     client_details="/tmp/clients.json"
-    curl -s -X GET "http://$OIDCENDPOINT/auth/admin/realms/master/clients/" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $client_details
+    curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $client_details
     cid_check="/tmp/clientid.py"
 cat > $cid_check <<- "EOF"
 import json
@@ -2779,8 +2823,8 @@ print(client_required_id)
 EOF
 
     admincli_id=`python $cid_check $client_details admin-cli`
-    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/auth/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
-    curl -s -X PUT "http://$OIDCENDPOINT/auth/admin/realms/master/clients/$admincli_id" \
+    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
+    curl -s -X PUT "http://$OIDCENDPOINT/admin/realms/master/clients/$admincli_id" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
     --data '{
@@ -2789,8 +2833,8 @@ EOF
 	  }
    }'
     
-    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/auth/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
-    curl -s -X POST "http://$OIDCENDPOINT/auth/admin/realms/master/clients/" \
+    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
+    curl -s -X POST "http://$OIDCENDPOINT/admin/realms/master/clients/" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
     --data '{
@@ -2798,12 +2842,12 @@ EOF
     "name": "${client_account}",
     "rootUrl": '\"http://$OIDCENDPOINT\"',
     "adminUrl": '\"http://$OIDCENDPOINT\"',
-    "baseUrl": "/auth/realms/master/account",
+    "baseUrl": "/keycloak/realms/master/account",
     "surrogateAuthRequired": false,
     "enabled": true,
     "clientAuthenticatorType": "client-secret",
     "redirectUris": [
-        '\"http://$OIDC_REDIRECT_URL/*\"',
+        '\"http://$EXTERNAL_ENDPOINT_URL/*\"',
         '\"http://$PXC_FRONTEND/*\"',
         '\"http://$PXC_GRAFANA/*\"'
     ],
@@ -2919,7 +2963,7 @@ EOF
   echo ""
   echo "OIDC Client: $PXC_OIDC_CLIENT_ID configured."
   client_details="/tmp/clients.json"
-  curl -s -X GET "http://$OIDCENDPOINT/auth/admin/realms/master/clients/" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $client_details
+  curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $client_details
   cid_check="/tmp/clientid.py"
 cat > $cid_check <<- "EOF"
 import json
@@ -2941,7 +2985,7 @@ print(client_required_id)
 EOF
 
   pxcentral_id=`python $cid_check $client_details $PXC_OIDC_CLIENT_ID`
-  PXC_OIDC_CLIENT_SECRET=`curl -s -X GET "http://$OIDCENDPOINT/auth/admin/realms/master/clients/$pxcentral_id/client-secret/" -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".value"`
+  PXC_OIDC_CLIENT_SECRET=`curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/$pxcentral_id/client-secret/" -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".value"`
   echo "OIDC client [$PXC_OIDC_CLIENT_ID] id: $pxcentral_id"
   echo "OIDC Client ID: $PXC_OIDC_CLIENT_ID"
   echo "OIDC Client Secret: $PXC_OIDC_CLIENT_SECRET"
@@ -2952,12 +2996,12 @@ EOF
     echo ""
     exit 1
   fi
-  pxadmin_user_id=`curl -s -X GET "http://$OIDCENDPOINT/auth/admin/realms/master/users/" \
+  pxadmin_user_id=`curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/users/" \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".[].id" | sed 's/\"//g'`
   echo "OIDC Admin user [$KEYCLOAK_FRONTEND_USERNAME] id: $pxadmin_user_id"
 
-  user_update_status=`curl -s -X PUT "http://$OIDCENDPOINT/auth/admin/realms/master/users/$pxadmin_user_id" \
+  user_update_status=`curl -s -X PUT "http://$OIDCENDPOINT/admin/realms/master/users/$pxadmin_user_id" \
       -H 'Content-Type: application/json' \
       -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
       --data '{
@@ -2967,7 +3011,7 @@ EOF
           "email": '\"$ADMINEMAIL\"'
       }'`
   updated_user_details="/tmp/admin_user.json"
-  curl -s -X GET "http://$OIDCENDPOINT/auth/admin/realms/master/users/" \
+  curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/users/" \
           -H 'Content-Type: application/json' \
           -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $updated_user_details
 
@@ -3029,7 +3073,7 @@ data:
   QUEUE_CONNECTION: sync
   SESSION_DRIVER: file
   SESSION_LIFETIME: "120"
-  OIDC_AUTHSERVERURL: http://'$OIDCENDPOINT'/auth/realms/master
+  OIDC_AUTHSERVERURL: http://'$OIDCENDPOINT'/realms/master
   OIDC_CLIENT_ID: '$PXC_OIDC_CLIENT_ID'
   OIDC_CLIENT_SECRET: '$PXC_OIDC_CLIENT_SECRET'
   OIDC_CLIENT_CALLBACK: http://'$PXENDPOINT':'$PXC_UI_EXTERNAL_PORT'/pxcentral/landing/oauth/oidc
@@ -3080,7 +3124,7 @@ data:
   QUEUE_CONNECTION: sync
   SESSION_DRIVER: file
   SESSION_LIFETIME: "120"
-  OIDC_AUTHSERVERURL: http://'$PXC_KEYCLOAK'/auth/realms/master
+  OIDC_AUTHSERVERURL: http://'$OIDCENDPOINT'/realms/master
   OIDC_CLIENT_ID: '$PXC_OIDC_CLIENT_ID'
   OIDC_CLIENT_SECRET: '$PXC_OIDC_CLIENT_SECRET'
   OIDC_CLIENT_CALLBACK: http://'$PXC_FRONTEND'/landing/oauth/oidc
@@ -3131,7 +3175,7 @@ data:
   QUEUE_CONNECTION: sync
   SESSION_DRIVER: file
   SESSION_LIFETIME: "120"
-  OIDC_AUTHSERVERURL: http://'$OIDCENDPOINT'/auth/realms/master
+  OIDC_AUTHSERVERURL: http://'$OIDCENDPOINT'/realms/master
   OIDC_CLIENT_ID: '$PXC_OIDC_CLIENT_ID'
   OIDC_CLIENT_SECRET: '$PXC_OIDC_CLIENT_SECRET'
   OIDC_CLIENT_CALLBACK: http://'$INGRESS_ENDPOINT'/pxcentral/landing/oauth/oidc
@@ -3183,9 +3227,9 @@ data:
     client_id= '$PXC_OIDC_CLIENT_ID'
     name= "OIDC"
     client_secret= '$PXC_OIDC_CLIENT_SECRET'
-    auth_url= http://'$OIDCENDPOINT'/auth/realms/master/protocol/openid-connect/auth 
-    token_url= http://'$OIDCENDPOINT'/auth/realms/master/protocol/openid-connect/token 
-    api_url= http://'$OIDCENDPOINT'/auth/realms/master/protocol/openid-connect/userinfo 
+    auth_url= http://'$OIDCENDPOINT'/realms/master/protocol/openid-connect/auth 
+    token_url= http://'$OIDCENDPOINT'/realms/master/protocol/openid-connect/token 
+    api_url= http://'$OIDCENDPOINT'/realms/master/protocol/openid-connect/userinfo 
     redirect_uri= http://'$pxcGrafanaEndpoint'/login/generic_oauth
     allowed_domains= 
     allow_sign_up= true
@@ -3197,7 +3241,7 @@ data:
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
   fi
 
-  OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$PXC_OIDC_CLIENT_ID&username=$KEYCLOAK_FRONTEND_USERNAME&password=$KEYCLOAK_FRONTEND_PASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/auth/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
+  OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$PXC_OIDC_CLIENT_ID&username=$KEYCLOAK_FRONTEND_USERNAME&password=$KEYCLOAK_FRONTEND_PASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
   if [ "$OIDC_USER_ACCESS_TOKEN" == "null" ]; then
     echo ""
     echo "ERROR: Falied to fetch PX-Central-Onprem OIDC admin user access token."
@@ -3428,13 +3472,7 @@ else
     echo "PX-Central PX-Backup Organization ID: $PX_BACKUP_ORGANIZATION"
   fi
   if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
-    if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
-      echo "Keycloak Endpoint: http://$OIDCENDPOINT"
-    elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-      echo "Keycloak Endpoint: http://$OIDCENDPOINT"
-    else
-      echo "Keycloak Endpoint: http://$OIDCENDPOINT/auth"
-    fi
+    echo "Keycloak Endpoint: http://$OIDCENDPOINT"
     echo "Keycloak admin user: $KEYCLOAK_FRONTEND_USERNAME"
     echo "Keycloak admin password: $KEYCLOAK_FRONTEND_PASSWORD"
     echo "OIDC CLIENT ID: $PXC_OIDC_CLIENT_ID, OIDC CLIENT SECRET: $PXC_OIDC_CLIENT_SECRET, OIDC ENDPOINT: $OIDCENDPOINT"
