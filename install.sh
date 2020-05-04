@@ -355,7 +355,7 @@ ONPREMOPERATORIMAGE="portworx/pxcentral-onprem-operator:1.0.1"
 PXCENTRALAPISERVER="portworx/pxcentral-onprem-api:1.0.1"
 PXOPERATORIMAGE="portworx/px-operator:1.3.1"
 PXCPRESETUPIMAGE="portworx/pxcentral-onprem-pre-setup:1.0.1"
-PXDEVIMAGE="portworx/px-dev:2.4.0"
+PXDEVIMAGE="portworx/px-dev:2.5.0"
 PXCLSLABELSETIMAGE="pwxbuild/pxc-macaddress-config:1.0.1"
 PXBACKUPIMAGE="portworx/px-backup:1.0.0"
 
