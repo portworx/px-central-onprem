@@ -577,7 +577,7 @@ apiVersion: extensions/v1beta1
 kind: Ingress
 metadata:
   name: pxc-onprem-central-ingress
-  namespace: portworx
+  namespace: '$PXCNAMESPACE'
   annotations:
     kubernetes.io/ingress.class: nginx
     nginx.ingress.kubernetes.io/app-root: /pxcentral
@@ -903,10 +903,10 @@ GCP_DISK_PROVISIONED_REQUIRED="false"
 AZURE_DISK_PROVISIONED_REQUIRED="false"
 if [ ${CLOUDPLATFORM} ]; then
   ISCLOUDDEPLOYMENT="true"
-  if [[ -z "$CLOUDPLATFORM" && "$CLOUDPLATFORM" != "$AWS_PROVIDER" && "$CLOUDPLATFORM" != "$GOOGLE_PROVIDER" && "$CLOUDPLATFORM" != "$AZURE_PROVIDER" && "$CLOUDPLATFORM" != "$VSPHERE_PROVIDER" ]]; then
+  if [[ -z "$CLOUDPLATFORM" && "$CLOUDPLATFORM" != "$AWS_PROVIDER" && "$CLOUDPLATFORM" != "$GOOGLE_PROVIDER" && "$CLOUDPLATFORM" != "$AZURE_PROVIDER" && "$CLOUDPLATFORM" != "$VSPHERE_PROVIDER" && "$CLOUDPLATFORM" != "$IBM_PROVIDER" ]]; then
     echo ""
     echo "Warning: PX-Central cloud deployments supports following providers:"
-    echo "         aws | gcp | azure | vsphere"
+    echo "         aws | gcp | azure | vsphere | ibm"
     exit 1
   fi
   if [[ "$CLOUDPLATFORM" == "$AWS_PROVIDER" && ${CLOUDSTRORAGE} ]]; then
@@ -1289,7 +1289,7 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
 
   OIDCCLIENTID=$PXC_OIDC_CLIENT_ID
   OIDCSECRET="dummy"
-  pxcGrafanaEndpoint="http://pxc-grafana.portworx.svc.cluster.local:3000/grafana"
+  pxcGrafanaEndpoint="http://pxc-grafana.$PXCNAMESPACE.svc.cluster.local:3000/grafana"
   if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
     OIDCENDPOINT="$PXC_KEYCLOAK/auth"
     EXTERNAL_ENDPOINT_URL=$PXC_FRONTEND
