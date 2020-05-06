@@ -55,6 +55,7 @@ Optional:
     --vsphere-password <Vsphere vcenter password>
     --vsphere-insecure <Vsphere vcenter endpoint insecure>
     --domain <Domain to deploy and expose PX-Central services>
+    --ingress-controller <Provision ingress controller>
 
 Examples:
     # Deploy PX-Central without OIDC:
@@ -314,6 +315,8 @@ while [ "$1" != "" ]; do
     --domain)                           shift
                                         DOMAIN=$1
                                         ;;
+    --ingress-controller)               INGRESS_CONTROLLER_PROVISION="true"
+                                        ;;
     -h | --help )   usage
                     ;;
     * )             usage
@@ -567,7 +570,6 @@ if [ ${DOMAIN} ]; then
 fi
 
 if [[ "$DOMAIN_SETUP_REQUIRED" == "false" && "$ISCLOUDDEPLOYMENT" == "true" ]]; then
-  PUBLIC_ENDPOINT_SETUP_REQUIRED="false"
   INGRESS_SETUP_REQUIRED="true"
 fi
 
@@ -774,13 +776,15 @@ if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "true" ]]; then
 fi
 
 if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "false" && "$PX_BACKUP_DEPLOY" == "true" ]]; then
-  OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$OIDCCLIENTID&username=$ADMINUSER&password=$ADMINPASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
-  if [[ -z ${OIDC_USER_ACCESS_TOKEN} && "$OIDC_USER_ACCESS_TOKEN" == "null" ]]; then
-      echo "ERROR: Failed to fetch OIDC user [$ADMINUSER] access token which is required to create organization in PX-Backup"
-      echo "Specify with flag : --oidc-user-access-token <OIDC_USER_ACCESS_TOKEN>"
-      echo ""
-      usage
-      exit 1
+  if [ -z ${OIDC_USER_ACCESS_TOKEN} ]; then
+    OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$OIDCCLIENTID&username=$ADMINUSER&password=$ADMINPASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
+    if [[ -z ${OIDC_USER_ACCESS_TOKEN} && "$OIDC_USER_ACCESS_TOKEN" == "null" ]]; then
+        echo "ERROR: Failed to fetch OIDC user [$ADMINUSER] access token which is required to create organization in PX-Backup"
+        echo "Specify with flag : --oidc-user-access-token <OIDC_USER_ACCESS_TOKEN>"
+        echo ""
+        usage
+        exit 1
+    fi
   fi
 fi
 
@@ -1032,6 +1036,665 @@ if [[ ${PXCINPUTENDPOINT} || "$CLOUDPLATFORM" == "$VSPHERE_PROVIDER" ]]; then
   INGRESS_SETUP_REQUIRED="false"
 fi
 
+if [[ "$INGRESS_CONTROLLER_PROVISION" == "true" || "$INGRESS_SETUP_REQUIRED" == "true" ]]; then
+  PUBLIC_ENDPOINT_SETUP_REQUIRED="false"
+  ingress_controller_config="/tmp/ingress_controller.yaml"
+cat <<< '
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: '$PXCNAMESPACE'
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+---
+# Source: ingress-nginx/templates/controller-serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx
+  namespace: '$PXCNAMESPACE'
+---
+# Source: ingress-nginx/templates/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+  name: ingress-nginx
+  namespace: '$PXCNAMESPACE'
+rules:
+  - apiGroups:
+      - '\'\''
+    resources:
+      - configmaps
+      - endpoints
+      - nodes
+      - pods
+      - secrets
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - '\'\''
+    resources:
+      - nodes
+    verbs:
+      - get
+  - apiGroups:
+      - '\'\''
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - update
+      - watch
+  - apiGroups:
+      - extensions
+      - networking.k8s.io   # k8s 1.14+
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - '\'\''
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - extensions
+      - networking.k8s.io   # k8s 1.14+
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - networking.k8s.io   # k8s 1.14+
+    resources:
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+---
+# Source: ingress-nginx/templates/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+  name: ingress-nginx
+  namespace: '$PXCNAMESPACE'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ingress-nginx
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx
+    namespace: '$PXCNAMESPACE'
+---
+# Source: ingress-nginx/templates/controller-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx
+  namespace: '$PXCNAMESPACE'
+rules:
+  - apiGroups:
+      - '\'\''
+    resources:
+      - namespaces
+    verbs:
+      - get
+  - apiGroups:
+      - '\'\''
+    resources:
+      - configmaps
+      - pods
+      - secrets
+      - endpoints
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - '\'\''
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - update
+      - watch
+  - apiGroups:
+      - extensions
+      - networking.k8s.io   # k8s 1.14+
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions
+      - networking.k8s.io   # k8s 1.14+
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - networking.k8s.io   # k8s 1.14+
+    resources:
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - '\'\''
+    resources:
+      - configmaps
+    resourceNames:
+      - ingress-controller-leader-nginx
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - '\'\''
+    resources:
+      - configmaps
+    verbs:
+      - create
+  - apiGroups:
+      - '\'\''
+    resources:
+      - endpoints
+    verbs:
+      - create
+      - get
+      - update
+  - apiGroups:
+      - '\'\''
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+# Source: ingress-nginx/templates/controller-rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx
+  namespace: '$PXCNAMESPACE'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ingress-nginx
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx
+    namespace: '$PXCNAMESPACE'
+---
+# Source: ingress-nginx/templates/controller-service-webhook.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller-admission
+  namespace: '$PXCNAMESPACE'
+spec:
+  type: ClusterIP
+  ports:
+    - name: https-webhook
+      port: 443
+      targetPort: webhook
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+---
+# Source: ingress-nginx/templates/controller-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller
+  namespace: '$PXCNAMESPACE'
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: https
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+---
+# Source: ingress-nginx/templates/controller-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+  name: ingress-nginx-controller
+  namespace: '$PXCNAMESPACE'
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/instance: ingress-nginx
+      app.kubernetes.io/component: controller
+  revisionHistoryLimit: 10
+  minReadySeconds: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
+        app.kubernetes.io/component: controller
+    spec:
+      dnsPolicy: ClusterFirst
+      containers:
+        - name: controller
+          image: quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.31.1
+          imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /wait-shutdown
+          args:
+            - /nginx-ingress-controller
+            - --publish-service='$PXCNAMESPACE'/ingress-nginx-controller
+            - --election-id=ingress-controller-leader
+            - --ingress-class=nginx
+            - --configmap='$PXCNAMESPACE'/ingress-nginx-controller
+            - --validating-webhook=:8443
+            - --validating-webhook-certificate=/usr/local/certificates/cert
+            - --validating-webhook-key=/usr/local/certificates/key
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+            runAsUser: 101
+            allowPrivilegeEscalation: true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+            - name: webhook
+              containerPort: 8443
+              protocol: TCP
+          volumeMounts:
+            - name: webhook-cert
+              mountPath: /usr/local/certificates/
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 90Mi
+      serviceAccountName: ingress-nginx
+      terminationGracePeriodSeconds: 300
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: ingress-nginx-admission
+---
+# Source: ingress-nginx/templates/admission-webhooks/validating-webhook.yaml
+apiVersion: admissionregistration.k8s.io/v1beta1
+kind: ValidatingWebhookConfiguration
+metadata:
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  name: ingress-nginx-admission
+  namespace: '$PXCNAMESPACE'
+webhooks:
+  - name: validate.nginx.ingress.kubernetes.io
+    rules:
+      - apiGroups:
+          - extensions
+          - networking.k8s.io
+        apiVersions:
+          - v1beta1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - ingresses
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        namespace: '$PXCNAMESPACE'
+        name: ingress-nginx-controller-admission
+        path: /extensions/v1beta1/ingresses
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+rules:
+  - apiGroups:
+      - admissionregistration.k8s.io
+    resources:
+      - validatingwebhookconfigurations
+    verbs:
+      - get
+      - update
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ingress-nginx-admission
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx-admission
+    namespace: '$PXCNAMESPACE'
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/job-createSecret.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingress-nginx-admission-create
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+spec:
+  template:
+    metadata:
+      name: ingress-nginx-admission-create
+      labels:
+        helm.sh/chart: ingress-nginx-2.0.2
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
+        app.kubernetes.io/version: 0.31.1
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: admission-webhook
+    spec:
+      containers:
+        - name: create
+          image: jettech/kube-webhook-certgen:v1.2.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - create
+            - --host=ingress-nginx-controller-admission,ingress-nginx-controller-admission.'$PXCNAMESPACE'.svc
+            - --namespace='$PXCNAMESPACE'
+            - --secret-name=ingress-nginx-admission
+      restartPolicy: OnFailure
+      serviceAccountName: ingress-nginx-admission
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/job-patchWebhook.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingress-nginx-admission-patch
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+spec:
+  template:
+    metadata:
+      name: ingress-nginx-admission-patch
+      labels:
+        helm.sh/chart: ingress-nginx-2.0.2
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
+        app.kubernetes.io/version: 0.31.1
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: admission-webhook
+    spec:
+      containers:
+        - name: patch
+          image: jettech/kube-webhook-certgen:v1.2.0
+          args:
+            - patch
+            - --webhook-name=ingress-nginx-admission
+            - --namespace='$PXCNAMESPACE'
+            - --patch-mutating=false
+            - --secret-name=ingress-nginx-admission
+            - --patch-failure-policy=Fail
+      restartPolicy: OnFailure
+      serviceAccountName: ingress-nginx-admission
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+rules:
+  - apiGroups:
+      - '\'\''
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ingress-nginx-admission
+subjects:
+  - kind: ServiceAccount
+    name: ingress-nginx-admission
+    namespace: '$PXCNAMESPACE'
+---
+# Source: ingress-nginx/templates/admission-webhooks/job-patch/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingress-nginx-admission
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade,post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    helm.sh/chart: ingress-nginx-2.0.2
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/version: 0.31.1
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: admission-webhook
+  namespace: '$PXCNAMESPACE'
+---
+' > $ingress_controller_config
+  kubectl --kubeconfig=$KC apply -f $ingress_controller_config --namespace $PXCNAMESPACE &>/dev/null
+  sleep $SLEEPINTERVAL
+  ingressControllerCheck="0"
+  timecheck=0
+  while [ $ingressControllerCheck -ne "1" ]
+    do
+      ingress_pod=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "ingress-nginx-controller" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+      if [ "$ingress_pod" -eq "1" ]; then
+        ingressControllerCheck="1"
+        break
+      fi
+      showMessage "Waiting for Ingress Nginx Controller to be ready"
+      sleep $SLEEPINTERVAL
+      timecheck=$[$timecheck+$SLEEPINTERVAL]
+      if [ $timecheck -gt $TIMEOUT ]; then
+        echo ""
+        echo "ERROR: Failed to deploy Ingress Nginx Controller, Contact: support@portworx.com"
+        echo ""
+        exit 1
+      fi
+    done
+fi
+
 if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
   kubectl --kubeconfig=$KC apply -f $pxc_ingress --namespace $PXCNAMESPACE &>/dev/null
   kubectl --kubeconfig=$KC apply -f $pxc_keycloak_ingress --namespace $PXCNAMESPACE &>/dev/null
@@ -1040,10 +1703,10 @@ if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
   timecheck=0
   while [ $ingresscheck -ne "1" ]
     do
-      ingressHostEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found"`
-      ingressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found"`
-      keycloakIngressHostEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-keycloak-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found"`
-      keycloakIngressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-keycloak-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found"`
+      ingressHostEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found" | grep -v "NotFound"`
+      ingressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found" | grep -v "NotFound"`
+      keycloakIngressHostEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-keycloak-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].hostname} 2>&1 | grep -v "error" | grep -v "No resources found" | grep -v "NotFound"`
+      keycloakIngressIPEndpoint=`kubectl --kubeconfig=$KC get ingress pxc-onprem-central-keycloak-ingress --namespace $PXCNAMESPACE -o jsonpath={.status.loadBalancer.ingress[0].ip} 2>&1 | grep -v "error" | grep -v "No resources found" | grep -v "NotFound"`
       if [[ ${ingressHostEndpoint} && ${keycloakIngressHostEndpoint} ]]; then
         ingresscheck="1"
         break
@@ -2791,7 +3454,7 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
           keycloakPodName=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lapp.kubernetes.io/name=keycloak 2>&1 | grep -v NAME | awk '{print $1}'`
           echo "Keycloak pod: $keycloakPodName"
           if [ ${keycloakPodName} ]; then
-            kubectl --kubeconfig=$KC exec -it $keycloakPodName --namespace $PXCNAMESPACE -- bash -c "cd /opt/jboss/keycloak/bin/ && ./kcadm.sh config credentials --server http://localhost:8080/keycloak --realm master --user $KEYCLOAK_FRONTEND_USERNAME --password $KEYCLOAK_FRONTEND_PASSWORD && ./kcadm.sh update realms/master -s sslRequired=NONE"
+            kubectl --kubeconfig=$KC exec -it $keycloakPodName --namespace $PXCNAMESPACE -- bash -c "cd /opt/jboss/keycloak/bin/ && ./kcadm.sh config credentials --server http://localhost:8080/keycloak --realm master --user '$KEYCLOAK_FRONTEND_USERNAME' --password '$KEYCLOAK_FRONTEND_PASSWORD' && ./kcadm.sh update realms/master -s sslRequired=NONE"
             echo "Disabled ssl-required"
             echo ""
           fi
