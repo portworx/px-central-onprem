@@ -9,9 +9,12 @@ Usage: $0
 
 Required only with OIDC:
     --oidc <Enable OIDC for PX-Central components>
-    --oidc-clientid <OIDC client-id>
-    --oidc-secret <OIDC secret>
-    --oidc-endpoint <OIDC endpoint>
+    --oidc-clientid <External OIDC client-id>
+    --oidc-secret <External OIDC secret>
+    --oidc-endpoint <External OIDC endpoint>
+    --admin-user <PX-Central OIDC admin username>
+    --admin-password <PX-Central OIDC admin user password>
+    --admin-email <PX-Central OIDC admin user email address>
 
 Required only for cloud deployments:
     --cloud <Mandatory for cloud deployment. Note: Currently supported K8s managed services: EKS, GKE and AKS, Custom k8s clusters on AWS, GCP and Azure>
@@ -24,12 +27,10 @@ Required only for cloud deployments:
     --azure-client-id <Azure client ID>
     --azure-tenant-id <Azure tenant id>
     --managed <Managed k8s service cluster type>
+    --portworx-disk-provision-secret-name <Secret name which has disk provision required credentials>
 
 Optional:
     --cluster-name <PX-Central Cluster Name>
-    --admin-user <Admin user for PX-Central and Grafana>
-    --admin-password <Admin user password>
-    --admin-email <Admin user email address>
     --kubeconfig <Kubeconfig file>
     --custom-registry <Custom image registry path>
     --image-repo-name <Image repo name>
@@ -56,6 +57,7 @@ Optional:
     --vsphere-insecure <Vsphere vcenter endpoint insecure>
     --domain <Domain to deploy and expose PX-Central services>
     --ingress-controller <Provision ingress controller>
+    --proxy-forwarding <Enable proxy forwarding for pay as you go model>
 
 Examples:
     # Deploy PX-Central without OIDC:
@@ -197,13 +199,13 @@ while [ "$1" != "" ]; do
                       ADMINEMAIL=$1
                       ;;
     --oidc-clientid)  shift
-                      OIDCCLIENTID=$1
+                      EXTERNAL_OIDCCLIENTID=$1
                       ;;
     --oidc-secret)    shift
-                      OIDCSECRET=$1
+                      EXTERNAL_OIDCSECRET=$1
                       ;;
     --oidc-endpoint)  shift
-                      OIDCENDPOINT=$1
+                      EXTERNAL_OIDCENDPOINT=$1
                       ;;
     --license-password) shift
                         LICENSEADMINPASSWORD=$1
@@ -315,8 +317,17 @@ while [ "$1" != "" ]; do
     --domain)                           shift
                                         DOMAIN=$1
                                         ;;
-    --ingress-controller)               INGRESS_CONTROLLER_PROVISION="true"
-                                        ;;
+    --ingress-controller)                   INGRESS_CONTROLLER_PROVISION="true"
+                                            ;;
+    --re-configure)                         RE_DEPLOY_ON_SAME_CLUSTER="true"
+                                            ;;
+    --portworx-disk-provision-secret-name)  shift 
+                                            PX_DISK_PROVISION_SECRET_NAME=$1
+                                            ;;
+    --proxy-forwarding)                     ENABLE_PROXY_FORWARDING="true"
+                                            ;;
+    --proxy-forwarding-uat)                 ENABLE_PROXY_FORWARDING_FOR_UAT="true"
+                                            ;;
     -h | --help )   usage
                     ;;
     * )             usage
@@ -354,14 +365,17 @@ DEFAULT_DISK_SIZE="150"
 PXENDPOINT=""
 maxRetry=5
 
-ONPREMOPERATORIMAGE="portworx/pxcentral-onprem-operator:1.0.1"
-PXCENTRALAPISERVER="portworx/pxcentral-onprem-api:1.0.1"
+ONPREMOPERATORIMAGE="portworx/pxcentral-onprem-operator:1.0.2"
+PXCENTRALAPISERVER="portworx/pxcentral-onprem-api:1.0.2"
 PXOPERATORIMAGE="portworx/px-operator:1.3.1"
 PXCPRESETUPIMAGE="portworx/pxcentral-onprem-pre-setup:1.0.1"
 PXDEVIMAGE="portworx/px-dev:2.5.0"
 PXCLSLABELSETIMAGE="pwxbuild/pxc-macaddress-config:1.0.1"
-PXBACKUPIMAGE="portworx/px-backup:1.0.0"
-
+PXBACKUPIMAGE="portworx/px-backup:1.0.1"
+PX_CENTRAL_FRONTEND="portworx/pxcentral-onprem-ui-frontend:1.1.1"
+PX_CENTRAL_BACKEND="portworx/pxcentral-onprem-ui-backend:1.1.1"
+PX_CENTRAL_MIDDLEWARE="portworx/pxcentral-onprem-ui-lhbackend:1.1.1"
+PXC_PROXY_FORWARDING_IMAGE="pwxbuild/px-forwarding-proxy:1.0.0"
 IMAGEPULLPOLICY="Always"
 INGRESS_CHANGE_REQUIRED="false"
 PX_BACKUP_ORGANIZATION_DEFAULT="portworx"
@@ -389,7 +403,9 @@ INGRESS_ENDPOINT=""
 BACKUP_OIDC_SECRET_NAME="pxc-backup-secret"
 PX_BACKUP_NAMESPACE="px-backup"
 BACKUP_OIDC_ADMIN_SECRET_NAME="px-backup-admin-secret"
-
+OIDCENABLED="false"
+PROXY_DEPLOY_URL="rest.zuora.com"
+DEFAULT_PROXY_FORWARDING="false"
 PX_STORE_DEPLOY="false"
 PX_METRICS_DEPLOY="false"
 PX_BACKUP_DEPLOY="false"
@@ -408,7 +424,7 @@ PXC_KEYCLOAK_HTTP_PORT="31241"
 PXC_KEYCLOAK_HTTPS_PORT="31242"
 PXCENTRAL_INSTALL_ALL_COMPONENTS="true"
 OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION="10d"
-
+EXTERNAL_OIDC_ENABLED="false"
 VSPHERE_CLUSTER="false"
 VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED="false"
 VSPHERE_PROVIDER="vsphere"
@@ -426,22 +442,35 @@ STANDARD_NAMESPACE="kube-system"
 CENTRAL_DEPLOYED_PX="false"
 CLOUD_STORAGE_ENABLED="false"
 
+LOGFILE="/tmp/pxcentral-onprem-install.log"
+logInfo() {
+    echo "$(date): level=info msg=$@" >> "$LOGFILE"
+}
+logError() {
+    echo "$(date): level=error msg=$@" >> "$LOGFILE"
+}
+logWarning() {
+    echo "$(date): level=warning msg=$@" >> "$LOGFILE"
+}
 
 start_time=`date +%s`
+logInfo "+================================================+"
+logInfo "===========PX-Central-Onprem Installation Started============"
 if [[ ${PXCENTRAL_MINIK8S} && "$PXCENTRAL_MINIK8S" == "true" ]]; then
   PX_BACKUP_DEPLOY="true"
   PX_SINGLE_ETCD_DEPLOY="true"
   PXCENTRAL_INSTALL_ALL_COMPONENTS="false"
   STORK_SCHEDULER_REQUIRED="false"
 fi
-
+logInfo "Minik8s : $PXCENTRAL_MINIK8S, All components flag: $PXCENTRAL_INSTALL_ALL_COMPONENTS"
 if [[ "$PXCENTRAL_MINIK8S" == "true" && "$PXCENTRAL_INSTALL_ALL_COMPONENTS" == "true" ]]; then
   echo ""
   echo "ERROR: --mini and --all cannot be given together."
+  logError "--mini and --all cannot be given together."
   echo ""
   usage
 fi
-
+logInfo "PX Cluster: $PX_STORE, PX Backup: $PX_BACKUP, PX Metrics Store: $PX_METRICS, Floating License Server: $PX_LICENSE_SERVER"
 if [[ ${PX_STORE} || ${PX_BACKUP} || ${PX_METRICS} || ${PX_LICENSE_SERVER} ]]; then
   PXCENTRAL_INSTALL_ALL_COMPONENTS="false"
   if [ -z ${PXCENTRAL_MINIK8S} ]; then
@@ -461,7 +490,15 @@ fi
 if [ -z ${PXCNAMESPACE} ]; then
   PXCNAMESPACE=$PXCNAMESPACE_DEFAULT
 fi
-
+if [ -z ${ENABLE_PROXY_FORWARDING} ]; then
+  ENABLE_PROXY_FORWARDING=$DEFAULT_PROXY_FORWARDING
+  logInfo "Proxy forwarding enabled: $ENABLE_PROXY_FORWARDING"
+fi
+if [[ ${ENABLE_PROXY_FORWARDING_FOR_UAT} && "$ENABLE_PROXY_FORWARDING_FOR_UAT" == "true" ]]; then
+  PROXY_DEPLOY_URL="rest.apisandbox.zuora.com"
+fi
+logInfo "Zuora Endpoint: $PROXY_DEPLOY_URL"
+logInfo "PX-Central Namespace: $PXCNAMESPACE"
 if [ ${PX_STORE} ]; then
   PX_STORE_DEPLOY="true"
   CENTRAL_DEPLOYED_PX="true"
@@ -476,10 +513,11 @@ fi
 if [ ${PX_LICENSE_SERVER} ]; then
   PX_LICENSE_SERVER_DEPLOY="true"
 fi
-
+logInfo "PX Deploy: $PX_STORE_DEPLOY, PX Metrics store: $PX_METRICS_DEPLOY, PX Backup deploy: $PX_BACKUP_DEPLOY, PX Etcd deploy: $PX_ETCD_DEPLOY, License server: $PX_LICENSE_SERVER_DEPLOY, Central PX: $CENTRAL_DEPLOYED_PX"
 if [[ "$PXCENTRAL_MINIK8S" == "true" && ( "$PX_STORE_DEPLOY" == "true" || "$PX_LICENSE_SERVER_DEPLOY" == "true" || "$PX_METRICS_DEPLOY" == "true" ) ]]; then
   echo ""
   echo "ERROR: On mini k8s cluster px-store and license server cannot be deployed."
+  logError "On mini k8s cluster px-store and license server cannot be deployed."
   echo ""
   usage
 fi
@@ -490,16 +528,37 @@ if [[ ${OPENSHIFTCLUSTER} && "$OPENSHIFTCLUSTER" == "true" ]]; then
   if [ -z ${checkOC} ]; then
     echo ""
     echo "ERROR: install script requires 'oc' client utility present on the local machine else run install script from openshift master node."
+    logError "Install script requires 'oc' client utility present on the local machine else run install script from openshift master node."
     echo ""
     exit 1
   fi
 elif [ -z ${checkKubectlCLI} ]; then
   echo ""
   echo "ERROR: install script requires 'kubectl' client utility present on the instance where it runs."
+  logError "Install script requires 'kubectl' client utility present on the instance where it runs."
   echo ""
   exit 1
 fi
 
+checkPythonCLI=`which python 2>&1`
+checkPython3CLI=`which python3 2>&1`
+cmdPython=""
+if [[ -z ${checkPythonCLI} || -z ${checkPython3CLI} ]]; then
+  echo ""
+  echo "ERROR: install script requires 'python' or 'python3' present on the instance where install script will run."
+  logError "Install script requires 'python' or 'python3' present on the instance where install script will run."
+  echo ""
+  exit 1
+else
+  if [ ${checkPythonCLI} ]; then
+    logInfo "Python CLI : $checkPythonCLI"
+    cmdPython=$checkPythonCLI
+  else
+    logInfo "Python3 CLI : $checkPython3CLI"
+    cmdPython=$checkPython3CLI
+  fi
+fi
+logInfo "Python executable path: $cmdPython"
 echo ""
 export dotCount=0
 export maxDots=15
@@ -542,6 +601,7 @@ fi
 if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
   if [ -z ${LICENSEADMINPASSWORD} ]; then
     echo "ERROR : License server admin password is required"
+    logError "License server admin password is required"
     echo ""
     usage
     exit 1
@@ -549,6 +609,8 @@ if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
   license_password=`echo -n $LICENSEADMINPASSWORD | grep -E '[0-9]' | grep -E '[a-z]' | grep -E '[A-Z]' | grep -E '[!@#$%]' | grep -v '[)(*&^<>?~|\/.,+_=-]'`
   if [ -z $license_password ]; then
     echo "ERROR: License server password does not meet secure password requirements, Your password must be have at least 1 special symbol, 1 capital letter and 1 numeric value."
+    echo "Warning: Supported special symbols are: [!@#$%]"
+    logError "License server password does not meet secure password requirements, Your password must be have at least 1 special symbol, 1 capital letter and 1 numeric value."
     echo ""
     usage
   fi
@@ -567,13 +629,24 @@ if [ ${DOMAIN} ]; then
   PXC_MIDDLEWARE="px-central-middleware.$DOMAIN"
   PXC_GRAFANA="px-central-grafana.$DOMAIN"
   PXC_KEYCLOAK="px-central-keycloak.$DOMAIN"
+  PXC_PROXY_FORWARDING="px-central-proxy.$DOMAIN" 
+  logInfo "Domain setup required: $DOMAIN_SETUP_REQUIRED, PX-Central endpoint: $PUBLIC_ENDPOINT_SETUP_REQUIRED, Ingress setup required: $INGRESS_SETUP_REQUIRED"
+  logInfo "User input domain name: $DOMAIN"
+  logInfo "PX-Central-Frontend sub domain name: $PXC_FRONTEND"
+  logInfo "PX-Central-Backend sub domain name: $PXC_BACKEND"
+  logInfo "PX-Central-Middleware sub domain name: $PXC_MIDDLEWARE"
+  logInfo "PX-Central-Grafana sub domain name: $PXC_GRAFANA"
+  logInfo "PX-Central-Keycloak sub domain name: $PXC_KEYCLOAK"
+  logInfo "PX-Central-Proxy sub domain name: $PXC_PROXY_FORWARDING"
 fi
 
 if [[ "$DOMAIN_SETUP_REQUIRED" == "false" && "$ISCLOUDDEPLOYMENT" == "true" ]]; then
   INGRESS_SETUP_REQUIRED="true"
+  logInfo "Ingress setup required: $INGRESS_SETUP_REQUIRED"
 fi
 
 pxc_domain="/tmp/pxc_domain.yaml"
+logInfo "PX-Central domain spec: $pxc_domain"
 cat <<< '
 apiVersion: extensions/v1beta1
 kind: Ingress
@@ -621,9 +694,17 @@ spec:
             serviceName: pxc-keycloak-http
             servicePort: 80
           path: /
+    - host: '$PXC_PROXY_FORWARDING'
+      http:
+        paths:
+        - backend:
+            serviceName: pxc-proxy-forwarding
+            servicePort: 8081
+          path: /
 ' > $pxc_domain
 
 pxc_ingress="/tmp/pxc_ingress.yaml"
+logInfo "PX-Central ingress spec: $pxc_ingress"
 cat <<< '
 apiVersion: extensions/v1beta1
 kind: Ingress
@@ -660,9 +741,16 @@ spec:
           serviceName: pxc-grafana
           servicePort: 3000
         path: /grafana(/|$)(.*)
+  - http:
+      paths:
+      - backend:
+          serviceName: pxc-proxy-forwarding
+          servicePort: 8081
+        path: /proxy(/|$)(.*)
 ' > $pxc_ingress
 
 pxc_keycloak_ingress="/tmp/pxc_keycloak_ingress.yaml"
+logInfo "PX-Central keycloak ingress spec: $pxc_keycloak_ingress"
 cat <<< '
 apiVersion: extensions/v1beta1
 kind: Ingress
@@ -683,29 +771,36 @@ spec:
 
 if [[ ${PKS_CLUSTER} && "$PKS_CLUSTER" == "true" ]]; then
   PKS_CLUSTER_ENABLED="true"
+  logInfo "PKS cluster enabled: $PKS_CLUSTER_ENABLED"
 fi
 
 if [ -z ${VSPHERE_INSECURE} ]; then
   VSPHERE_INSECURE="false"
+  logInfo "vSphere Insecure: $VSPHERE_INSECURE"
 fi
 
 if [[ "$PKS_CLUSTER" == "true" &&  "$CLOUDPLATFORM" == "$VSPHERE_PROVIDER" && "$CLOUDSTRORAGE" == "true" ]]; then
   VSPHERE_CLUSTER="true"
   VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED="true"
+  logInfo "vSphere cluster enabled: $VSPHERE_CLUSTER, vSphere cluster disk provision required: $VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED"
 fi 
 
 if [[ "$OPENSHIFTCLUSTER" == "true" &&  "$CLOUDPLATFORM" == "$VSPHERE_PROVIDER" && "$CLOUDSTRORAGE" == "true" ]]; then
   VSPHERE_CLUSTER="true"
   VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED="true"
+  logInfo "vSphere cluster enabled: $VSPHERE_CLUSTER, vSphere cluster disk provision required: $VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED"
 fi
 
 if [[ "$VSPHERE_CLUSTER" == "true" && "$VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED" == "true" ]]; then  
   CLOUD_STORAGE_ENABLED="true"
-  if [[ -z ${VSPHERE_USER} || -z ${VSPHERE_PASSWORD} || -z ${VSPHERE_VCENTER} || -z ${VSPHERE_VCENTER_PORT} || -z ${VSPHERE_DATASTORE_PREFIX} || -z "$VSPHERE_INSTALL_MODE" ]]; then
-    echo ""
-    echo "ERROR: Provide px-central-onprem deployment required details: --vsphere-vcenter-endpoint, --vsphere-vcenter-port, --vsphere-vcenter-datastore-prefix, --vsphere-vcenter-install-mode, --vsphere-user and --vsphere-password"
-    echo ""
-    usage
+  if [[ "$CLOUD_STORAGE_ENABLED" == "true" && -z ${PX_DISK_PROVISION_SECRET_NAME} ]]; then
+    if [[ -z ${VSPHERE_USER} || -z ${VSPHERE_PASSWORD} || -z ${VSPHERE_VCENTER} || -z ${VSPHERE_VCENTER_PORT} || -z ${VSPHERE_DATASTORE_PREFIX} || -z "$VSPHERE_INSTALL_MODE" ]]; then
+      echo ""
+      echo "ERROR: Provide px-central-onprem deployment required details: --vsphere-vcenter-endpoint, --vsphere-vcenter-port, --vsphere-vcenter-datastore-prefix, --vsphere-vcenter-install-mode, --vsphere-user and --vsphere-password"
+      logError "Provide px-central-onprem deployment required details: --vsphere-vcenter-endpoint, --vsphere-vcenter-port, --vsphere-vcenter-datastore-prefix, --vsphere-vcenter-install-mode, --vsphere-user and --vsphere-password"
+      echo ""
+      usage
+    fi
   fi
   if [ -z ${CLOUD_DATA_DISK_TYPE} ]; then
     CLOUD_DATA_DISK_TYPE=$PX_DISK_TYPE_DEFAULT
@@ -714,47 +809,50 @@ if [[ "$VSPHERE_CLUSTER" == "true" && "$VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED"
   if [ -z ${CLOUD_DATA_DISK_SIZE} ]; then
     CLOUD_DATA_DISK_SIZE=$PX_DISK_SIZE_DEFAULT
   fi
+  logInfo "Disk type: $CLOUD_DATA_DISK_TYPE, Disk size: $CLOUD_DATA_DISK_SIZE"
 fi
 
 if [ ${PXCOIDCREQUIRED} ]; then
   PXCPROVISIONEDOIDC="true"
   OIDCENABLED="true"
-elif [[ ( ! -n ${OIDCCLIENTID} ) &&  ( ! -n ${OIDCSECRET} ) && ( ! -n ${OIDCENDPOINT} ) ]]; then
-  OIDCENABLED="false"
-else
-  OIDCENABLED="true"
-  if [ -z $OIDCCLIENTID ]; then
-    echo "ERROR: PX-Central OIDC Client ID is required"
-    echo ""
-    usage
-    exit 1
-  fi
-
-  if [ -z $OIDCSECRET ]; then
-    echo "ERROR: PX-Central OIDC Client Secret is required"
-    echo ""
-    usage
-    exit 1
-  fi
-
-  if [ -z $OIDCENDPOINT ]; then
-    echo "ERROR: PX-Central OIDC Endpoint is required"
-    echo ""
-    usage
-    exit 1
-  fi
-  keycloak_endpoint=$OIDCENDPOINT
-  auth_substring='/'
-  if [[ "$keycloak_endpoint" == *"$auth_substring"* ]]; then
-    OIDCENDPOINT=$OIDCENDPOINT
-  else
-    OIDCENDPOINT="$OIDCENDPOINT/auth"
-  fi
+elif [[  -z ${EXTERNAL_OIDCCLIENTID} && -z ${EXTERNAL_OIDCSECRET} && -z ${EXTERNAL_OIDCENDPOINT} ]]; then
+  EXTERNAL_OIDC_ENABLED="false"
 fi
 
-if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "true" ]]; then
+if [[  ${EXTERNAL_OIDCCLIENTID} || ${EXTERNAL_OIDCSECRET} || ${EXTERNAL_OIDCENDPOINT} ]]; then
+  EXTERNAL_OIDC_ENABLED="true"
+  PXCPROVISIONEDOIDC="true"
+  OIDCENABLED="true"
+fi
+
+if [[ "$EXTERNAL_OIDC_ENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "true" ]]; then
+  if [ -z $EXTERNAL_OIDCCLIENTID ]; then
+    echo "ERROR: PX-Central OIDC Client ID is required"
+    logError "PX-Central OIDC Client ID is required"
+    echo ""
+    usage
+    exit 1
+  fi
+
+  if [ -z $EXTERNAL_OIDCSECRET ]; then
+    echo "ERROR: PX-Central OIDC Client Secret is required"
+    logError "PX-Central OIDC Client Secret is required"
+    echo ""
+    usage
+    exit 1
+  fi
+
+  if [ -z $EXTERNAL_OIDCENDPOINT ]; then
+    echo "ERROR: PX-Central OIDC Endpoint is required"
+    logError "PX-Central OIDC Endpoint is required"
+    echo ""
+    usage
+    exit 1
+  fi
+
   if [ -z ${ADMINUSER} ]; then
     echo "ERROR: OIDC admin user name is required"
+    logError "OIDC admin user name is required"
     echo ""
     usage
     exit 1
@@ -762,29 +860,62 @@ if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "true" ]]; then
 
   if [ -z ${ADMINPASSWORD} ]; then
     echo "ERROR: OIDC admin user password is required"
+    logError "OIDC admin user password is required"
     echo ""
     usage
     exit 1
+  else
+    oidc_admin_password=`echo -n $ADMINPASSWORD | grep -E '[0-9]' | grep -E '[a-z]' | grep -E '[A-Z]' | grep -E '[!@#$%]' | grep -v '[)(*&^<>?~|\/.,+_=-]'`
+    if [ -z $oidc_admin_password ]; then
+      echo "ERROR: OIDC admin user password does not meet secure password requirements, Your password must be have at least 1 special symbol, 1 capital letter and 1 numeric value."
+      echo "Warning: Supported special symbols are: [!@#$%]"
+      logError "OIDC admin user password does not meet secure password requirements, Your password must be have at least 1 special symbol, 1 capital letter and 1 numeric value."
+      echo ""
+      exit 1
+    fi
   fi
 
   if [ -z ${ADMINEMAIL} ]; then
     echo "ERROR: OIDC admin user email is required"
+    logError "OIDC admin user email is required"
     echo ""
     usage
     exit 1
   fi
 fi
 
-if [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "false" && "$PX_BACKUP_DEPLOY" == "true" ]]; then
-  if [ -z ${OIDC_USER_ACCESS_TOKEN} ]; then
-    OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$OIDCCLIENTID&username=$ADMINUSER&password=$ADMINPASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
-    if [[ -z ${OIDC_USER_ACCESS_TOKEN} && "$OIDC_USER_ACCESS_TOKEN" == "null" ]]; then
-        echo "ERROR: Failed to fetch OIDC user [$ADMINUSER] access token which is required to create organization in PX-Backup"
-        echo "Specify with flag : --oidc-user-access-token <OIDC_USER_ACCESS_TOKEN>"
-        echo ""
-        usage
-        exit 1
+if [[ "$EXTERNAL_OIDC_ENABLED" == "false" && "$PXCPROVISIONEDOIDC" == "true" ]]; then
+  if [ -z ${ADMINUSER} ]; then
+    echo "ERROR: OIDC admin user name is required"
+    logError "OIDC admin user name is required"
+    echo ""
+    usage
+    exit 1
+  fi
+
+  if [ -z ${ADMINPASSWORD} ]; then
+    echo "ERROR: OIDC admin user password is required"
+    logError "OIDC admin user password is required"
+    echo ""
+    usage
+    exit 1
+  else
+    oidc_admin_password=`echo -n $ADMINPASSWORD | grep -E '[0-9]' | grep -E '[a-z]' | grep -E '[A-Z]' | grep -E '[!@#$%]' | grep -v '[)(*&^<>?~|\/.,+_=-]'`
+    if [ -z $oidc_admin_password ]; then
+      echo "ERROR: OIDC admin user password does not meet secure password requirements, Your password must be have at least 1 special symbol, 1 capital letter and 1 numeric value."
+      echo "Warning: Supported special symbols are: [!@#$%]"
+      logError "OIDC admin user password does not meet secure password requirements, Your password must be have at least 1 special symbol, 1 capital letter and 1 numeric value."
+      echo ""
+      exit 1
     fi
+  fi
+
+  if [ -z ${ADMINEMAIL} ]; then
+    echo "ERROR: OIDC admin user email is required"
+    logError "OIDC admin user email is required"
+    echo ""
+    usage
+    exit 1
   fi
 fi
 
@@ -796,7 +927,8 @@ if [ -z ${KC} ]; then
     KC="$HOME/.kube/config"
 fi
 
-if [[ "$OIDCENABLED" == "false" && "$PXCPROVISIONEDOIDC" == "false" ]]; then
+if [ "$OIDCENABLED" == "false" ]; then
+  logInfo "External OIDC Enabled: $OIDCENABLED, PX-Central OIDC: $PXCPROVISIONEDOIDC"
   if [ -z ${ADMINUSER} ]; then
     ADMINUSER="pxadmin"
   fi
@@ -810,10 +942,20 @@ fi
 
 if [ -z ${PXCPXNAME} ]; then
     PXCPXNAME="pxcentral-onprem"
+    logInfo "PX-Central-Onprem portworx cluster name: $PXCPXNAME"
 fi
 
 if [ -z ${PX_BACKUP_ORGANIZATION} ]; then
   PX_BACKUP_ORGANIZATION=$PX_BACKUP_ORGANIZATION_DEFAULT
+  logInfo "PX-Backup organization name: $PX_BACKUP_ORGANIZATION"
+else
+  backup_org_name=`echo -n $PX_BACKUP_ORGANIZATION | grep -E '[a-z]' | grep -v '[A-Z]' | grep -v '[!@#$%]' | grep -v '[)(*&^<>?~|\/.,+_=]'`
+  if [ -z $backup_org_name ]; then
+    echo "ERROR: PX-Backup Organization name does not meet secure password requirements, Organization name required. Minimum 3 characters, No special symbol (!@#$%) and numbers."
+    logError "PX-Backup Organization name does not meet secure password requirements, Organization name required. Minimum 3 characters, No special symbol (!@#$%) and numbers."
+    echo ""
+    exit 1
+  fi
 fi
 
 # If not provided then reading from environment variables
@@ -846,6 +988,7 @@ fi
 
 if [[ ( ${CUSTOMREGISTRYENABLED} = "true" ) && ( -z ${CUSTOMREGISTRY} ) ]]; then
     echo "ERROR: Custom registry url is required for air-gapped installation."
+    logError "Custom registry url is required for air-gapped installation."
     echo ""
     usage 
     exit 1
@@ -853,6 +996,7 @@ fi
 
 if [[ ( $CUSTOMREGISTRYENABLED = "true" ) && ( -z ${IMAGEPULLSECRET} ) ]]; then
     echo "ERROR: Custom registry url and Image pull secret are required for air-gapped installation."
+    logError "Custom registry url and Image pull secret are required for air-gapped installation."
     echo ""
     usage 
     exit 1
@@ -860,6 +1004,7 @@ fi
 
 if [[ ( $CUSTOMREGISTRYENABLED = "true" ) && ( -z ${IMAGEREPONAME} ) ]]; then
     echo "ERROR: Custom registry url and image repository is required for air-gapped installation."
+    logError "Custom registry url and image repository is required for air-gapped installation."
     echo ""
     usage 
     exit 1
@@ -870,6 +1015,7 @@ if [ ${AIRGAPPED} ]; then
     AIRGAPPEDLICENSETYPE="true"
     if [[ ( "$CUSTOMREGISTRYENABLED" == "false" ) || ( -z ${CUSTOMREGISTRY} ) || ( -z ${IMAGEPULLSECRET} ) || ( -z ${IMAGEREPONAME} ) ]]; then
       echo "ERROR: Air gapped deployment requires --custom-registry,--image-repo-name and --image-pull-secret"
+      logError "Air gapped deployment requires --custom-registry,--image-repo-name and --image-pull-secret"
       echo ""
       usage
       exit 1
@@ -878,14 +1024,17 @@ if [ ${AIRGAPPED} ]; then
 fi
 
 if [ "$CUSTOMREGISTRYENABLED" == "true" ]; then
-  ONPREMOPERATORIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-operator:1.0.1"
-  PXCENTRALAPISERVER="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-api:1.0.1"
-  PXOPERATORIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-operator:1.3.1 "
+  ONPREMOPERATORIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-operator:1.0.2"
+  PXCENTRALAPISERVER="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-api:1.0.2"
+  PXOPERATORIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-operator:1.3.1"
   PXCPRESETUPIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-pre-setup:1.0.1"
-  PXDEVIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-dev:2.4.0"
+  PXDEVIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-dev:2.5.0"
   PXCLSLABELSETIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/pxc-macaddress-config:1.0.1"
-  PXBACKUPIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-backup:1.0.0-rc1"
-
+  PXBACKUPIMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-backup:1.0.1"
+  PX_CENTRAL_FRONTEND="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-ui-frontend:1.1.1"
+  PX_CENTRAL_BACKEND="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-ui-backend:1.1.1"
+  PX_CENTRAL_MIDDLEWARE="$CUSTOMREGISTRY/$IMAGEREPONAME/pxcentral-onprem-ui-lhbackend:1.1.1"
+  PXC_PROXY_FORWARDING_IMAGE="$CUSTOMREGISTRY/$IMAGEREPONAME/px-forwarding-proxy:1.0.0"
   echo "PX-Central-Operator Image: $ONPREMOPERATORIMAGE"
   echo "PX-Central-API-Server Image: $PXCENTRALAPISERVER"
   echo "PX-Central-PX-Operator Image: $PXOPERATORIMAGE"
@@ -894,6 +1043,7 @@ if [ "$CUSTOMREGISTRYENABLED" == "true" ]; then
   echo "PX-Central-License-LabelSet Image: $PXCLSLABELSETIMAGE"
   echo "PX-Central-PX-Backup Image: $PXCLSLABELSETIMAGE"
   echo ""
+  logInfo "PX-Central operator image: $ONPREMOPERATORIMAGE, PX API server image: $PXCENTRALAPISERVER, PX operator image: $PXOPERATORIMAGE, PX pre-setup image: $PXCPRESETUPIMAGE, PX dev image: $PXDEVIMAGE, PX license server image: $PXCLSLABELSETIMAGE, PX backup image: $PXCLSLABELSETIMAGE, Proxy image: $PXC_PROXY_FORWARDING_IMAGE"
 fi
 
 echo "Validate and Pre-Install check in progress:"
@@ -902,6 +1052,7 @@ GOOGLE_PROVIDER="gcp"
 AZURE_PROVIDER="azure"
 IBM_PROVIDER="ibm"
 METRICS_ENDPOINT="pxc-cortex-nginx.$PXCNAMESPACE.svc.cluster.local:80"
+logInfo "Metrics endpoint: $METRICS_ENDPOINT"
 AWS_DISK_PROVISIONED_REQUIRED="false"
 GCP_DISK_PROVISIONED_REQUIRED="false"
 AZURE_DISK_PROVISIONED_REQUIRED="false"
@@ -911,16 +1062,21 @@ if [ ${CLOUDPLATFORM} ]; then
     echo ""
     echo "Warning: PX-Central cloud deployments supports following providers:"
     echo "         aws | gcp | azure | vsphere | ibm"
+    logWarning "PX-Central cloud deployments supports following providers:"
+    logWarning "         aws | gcp | azure | vsphere | ibm"
     exit 1
   fi
   if [[ "$CLOUDPLATFORM" == "$AWS_PROVIDER" && ${CLOUDSTRORAGE} ]]; then
-    if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
-      echo ""
-      echo "ERROR: PX-Central deployments on aws cloud with cloudstorage option requires --aws-access-key and --aws-secret-key"
-      echo ""
-      usage
-    fi
     CLOUD_STORAGE_ENABLED="true"
+    if [[ "$CLOUD_STORAGE_ENABLED" == "true" && -z ${PX_DISK_PROVISION_SECRET_NAME} ]]; then
+      if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+        echo ""
+        echo "ERROR: PX-Central deployments on aws cloud with cloudstorage option requires --aws-access-key and --aws-secret-key"
+        logError "PX-Central deployments on aws cloud with cloudstorage option requires --aws-access-key and --aws-secret-key"
+        echo ""
+        usage
+      fi
+    fi
     AWS_CLOUD_PLATFORM="true"
     AWS_DISK_PROVISIONED_REQUIRED="true"
     if [ -z ${CLOUD_DATA_DISK_TYPE} ]; then
@@ -940,13 +1096,16 @@ if [ ${CLOUDPLATFORM} ]; then
       CLOUD_DATA_DISK_SIZE=$DEFAULT_DISK_SIZE
     fi
   elif [[ "$CLOUDPLATFORM" == "$AZURE_PROVIDER" && ${CLOUDSTRORAGE} ]]; then
-    if [[ -z "$AZURE_CLIENT_SECRET" || -z "$AZURE_CLIENT_ID" || -z "$AZURE_TENANT_ID" ]]; then
-      echo ""
-      echo "ERROR: PX-Central deployments on azure cloud with cloudstorage option requires --azure-client-secret, --azure-client-id and --azure-tenant-id"
-      echo ""
-      usage
-    fi
     CLOUD_STORAGE_ENABLED="true"
+    if [[ "$CLOUD_STORAGE_ENABLED" == "true" && -z ${PX_DISK_PROVISION_SECRET_NAME} ]]; then
+      if [[ -z "$AZURE_CLIENT_SECRET" || -z "$AZURE_CLIENT_ID" || -z "$AZURE_TENANT_ID" ]]; then
+        echo ""
+        echo "ERROR: PX-Central deployments on azure cloud with cloudstorage option requires --azure-client-secret, --azure-client-id and --azure-tenant-id"
+        logError "PX-Central deployments on azure cloud with cloudstorage option requires --azure-client-secret, --azure-client-id and --azure-tenant-id"
+        echo ""
+        usage
+      fi
+    fi
     AZURE_CLOUD_PLATFORM="true"
     AZURE_DISK_PROVISIONED_REQUIRED="true"
     if [ -z ${CLOUD_DATA_DISK_TYPE} ]; then
@@ -962,8 +1121,10 @@ fi
 
 if [ -f "$KC" ]; then
     echo "Using Kubeconfig: $KC"
+    logInfo "Using Kubeconfig: $KC"
 else 
     echo "ERROR : Kubeconfig [ $KC ] does not exist"
+    logError "Kubeconfig [ $KC ] does not exist"
     usage
 fi
 
@@ -971,14 +1132,31 @@ checkK8sVersion=`kubectl --kubeconfig=$KC version --short | grep -v "i/o timeout
 if [ -z $checkK8sVersion ]; then
   echo ""
   echo "ERROR : Invalid kubeconfig, Unable to connect to the server"
+  logError "Invalid kubeconfig, Unable to connect to the server"
   echo ""
   exit 1
 fi
 
-kubectl --kubeconfig=$KC create namespace $PXCNAMESPACE &>/dev/null
-kubectl --kubeconfig=$KC create namespace $PX_BACKUP_NAMESPACE &>/dev/null
+if [ -z ${RE_DEPLOY_ON_SAME_CLUSTER} ]; then
+  RE_DEPLOY_ON_SAME_CLUSTER="false"
+fi
+existing_pxcentralonprem_name=`kubectl --kubeconfig=$KC get pxcentralonprem --all-namespaces 2>&1 | grep NAME | wc -l 2>&1`
+existing_pxcentralonprem_object=`kubectl --kubeconfig=$KC get pxcentralonprem --all-namespaces 2>&1 | grep -v NAME | grep "pxcentralonprem" | wc -l 2>&1`
+if [[ "$existing_pxcentralonprem_name" -eq "1" && "$existing_pxcentralonprem_object" -eq "1" && "$RE_DEPLOY_ON_SAME_CLUSTER" == "false" ]]; then
+  logInfo "PX-Central-Onprem already running on this cluster."
+  kubectl --kubeconfig=$KC get pxcentralonprem --all-namespaces &> "$LOGFILE"
+  echo ""
+  echo "PX-Central-Onprem already running on this cluster, More than one PX-Central-Onprem clusters on same kubernetes or openshift cluster is not supported."
+  echo "If you want to re-configure PX-Central-Onprem cluster use flag : --re-configure"
+  echo ""
+  exit 1
+fi
+
+kubectl --kubeconfig=$KC create namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC create namespace $PX_BACKUP_NAMESPACE &> "$LOGFILE"
 
 echo "Kubernetes cluster version: $checkK8sVersion"
+logInfo "Kubernetes cluster version: $checkK8sVersion"
 k8sVersion=$checkK8sVersion
 k8sVersion111Validate=`echo -n $checkK8sVersion | grep -E '1.11'`
 k8sVersion112Validate=`echo -n $checkK8sVersion | grep -E '1.12'`
@@ -993,6 +1171,9 @@ if [[ -z "$k8sVersion111Validate" && -z "$k8sVersion112Validate" && -z "$k8sVers
   echo "Warning: PX-Central supports following versions:"
   echo "         K8s: 1.11.x, 1.12.x, 1.13.x, 1.14.x, 1.15.x, 1.16.x, 1.17.x and 1.18.x"
   echo "         Openshift: 3.11, 4.2 and 4.3"
+  logWarning "PX-Central supports following versions:"
+  logInfo "         K8s: 1.11.x, 1.12.x, 1.13.x, 1.14.x, 1.15.x, 1.16.x, 1.17.x and 1.18.x"
+  logInfo "         Openshift: 3.11, 4.2 and 4.3"
   echo ""
   exit 1
 fi 
@@ -1015,7 +1196,7 @@ if [ ${MANAGED_K8S_SERVICE} ]; then
     AKS_CLUSTER_TYPE="true"
   fi
 fi
-
+logInfo "Manage k8s service: $MANAGED_K8S_SERVICE, GKE cluster: $GKE_CLUSTER_TYPE, EKS cluster: $EKS_CLUSTER_TYPE, AKS cluster: $AKS_CLUSTER_TYPE"
 if [[ -z "$k8sVersion112Validate" && -z "$k8sVersion113Validate" && -z "$k8sVersion114Validate" && -z "$k8sVersion115Validate" && -z "$k8sVersion116Validate" && -z "$k8sVersion117Validate" && -z "$k8sVersion118Validate" ]]; then
   OPERATOR_UNSUPPORTED_CLUSTER="true"
 fi
@@ -1039,6 +1220,7 @@ fi
 if [[ "$INGRESS_CONTROLLER_PROVISION" == "true" || "$INGRESS_SETUP_REQUIRED" == "true" ]]; then
   PUBLIC_ENDPOINT_SETUP_REQUIRED="false"
   ingress_controller_config="/tmp/ingress_controller.yaml"
+  logInfo "Ingress controller spec: $ingress_controller_config"
 cat <<< '
 apiVersion: v1
 kind: Namespace
@@ -1672,32 +1854,58 @@ metadata:
   namespace: '$PXCNAMESPACE'
 ---
 ' > $ingress_controller_config
-  kubectl --kubeconfig=$KC apply -f $ingress_controller_config --namespace $PXCNAMESPACE &>/dev/null
+  if [ ! -f $ingress_controller_config ]; then
+    echo "Failed to create file: $ingress_controller_config, verify you have right access to create file: $ingress_controller_config"
+    logError "Failed to create file: $ingress_controller_config, verify you have right access to create file: $ingress_controller_config"
+    echo ""
+    exit 1
+  fi
+  logInfo "Creating ingress controller config using spec: $ingress_controller_config"
+  kubectl --kubeconfig=$KC apply -f $ingress_controller_config --namespace $PXCNAMESPACE &> "$LOGFILE"
   sleep $SLEEPINTERVAL
   ingressControllerCheck="0"
   timecheck=0
   while [ $ingressControllerCheck -ne "1" ]
     do
       ingress_pod=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "ingress-nginx-controller" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+      logInfo "Ingress controller ready replica count: $ingress_pod"
       if [ "$ingress_pod" -eq "1" ]; then
         ingressControllerCheck="1"
         break
       fi
       showMessage "Waiting for Ingress Nginx Controller to be ready"
+      logInfo "Waiting for Ingress Nginx Controller to be ready"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
+        kubectl --kubeconfig=$KC logs $ingress_pod --namespace $PXCNAMESPACE &> "$LOGFILE"
         echo "ERROR: Failed to deploy Ingress Nginx Controller, Contact: support@portworx.com"
+        logError "Failed to deploy Ingress Nginx Controller, Contact: support@portworx.com"
         echo ""
         exit 1
       fi
     done
+    logInfo "Ingress controller deployed successfully..."
 fi
 
 if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-  kubectl --kubeconfig=$KC apply -f $pxc_ingress --namespace $PXCNAMESPACE &>/dev/null
-  kubectl --kubeconfig=$KC apply -f $pxc_keycloak_ingress --namespace $PXCNAMESPACE &>/dev/null
+  if [ ! -f $pxc_ingress ]; then
+    echo "Failed to create file: $pxc_ingress, verify you have right access to create file: $pxc_ingress"
+    logError "Failed to create file: $pxc_ingress, verify you have right access to create file: $pxc_ingress"
+    echo ""
+    exit 1
+  fi
+  logInfo "Creating ingress for px-central services using spec: $pxc_ingress"
+  kubectl --kubeconfig=$KC apply -f $pxc_ingress --namespace $PXCNAMESPACE &> "$LOGFILE"
+  if [ ! -f $pxc_keycloak_ingress ]; then
+    echo "Failed to create file: $pxc_keycloak_ingress, verify you have right access to create file: $pxc_keycloak_ingress"
+    logError "Failed to create file: $pxc_keycloak_ingress, verify you have right access to create file: $pxc_keycloak_ingress"
+    echo ""
+    exit 1
+  fi
+  logInfo "Creating ingress for keycloak using spec: $pxc_keycloak_ingress"
+  kubectl --kubeconfig=$KC apply -f $pxc_keycloak_ingress --namespace $PXCNAMESPACE &> "$LOGFILE"
   sleep 10
   ingresscheck="0"
   timecheck=0
@@ -1715,11 +1923,15 @@ if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
         break
       fi
       showMessage "Waiting for PX-Central-Onprem endpoint"
+      logInfo "Waiting for PX-Central-Onprem endpoint.."
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
+        podName=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "ingress-nginx-controller" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+        kubectl --kubeconfig=$KC logs $podName --namespace $PXCNAMESPACE &> "$LOGFILE"
         echo "ERROR: PX-Central deployment failed, failed to get hostname. Contact: support@portworx.com"
+        logError "PX-Central deployment failed, failed to get hostname. Contact: support@portworx.com"
         echo ""
         exit 1
       fi
@@ -1733,8 +1945,11 @@ if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
   fi
   INGRESS_ENDPOINT=$PXCINPUTENDPOINT
   KEYCLOAK_INGRESS_ENDPOINT=$OIDCENDPOINT
+  echo ""
   echo "PX-Central-Onprem Endpont: $INGRESS_ENDPOINT"
   echo "PX-Central-Onprem Keycloak Endpont: $KEYCLOAK_INGRESS_ENDPOINT"
+  logInfo "PX-Central-Onprem Endpont: $INGRESS_ENDPOINT"
+  logInfo "PX-Central-Onprem Keycloak Endpont: $KEYCLOAK_INGRESS_ENDPOINT"
 fi
 
 if [ -z ${PXCINPUTENDPOINT} ]; then
@@ -1745,6 +1960,7 @@ if [ -z ${PXCINPUTENDPOINT} ]; then
 
   if [ -z ${PXENDPOINT} ]; then
     echo "PX-Central endpoint empty."
+    logError "PX-Central endpoint empty, Provide public endpoint to configure and access PX-Central."
     echo ""
     usage
     exit 1
@@ -1753,13 +1969,16 @@ else
   PXENDPOINT=$PXCINPUTENDPOINT
 fi
 echo "Using PX-Central Endpoint as: $PXENDPOINT"
+logInfo "Using PX-Central Endpoint as: $PXENDPOINT"
 echo ""
 
 resource_check="true"
 USE_EXISTING_PX="false"
+PXOPERATORDEPLOYMENT="true"
 PXCENTRAL_PX_APP_SAME_K8S_CLUSTER="false"
 nodeCount=`kubectl --kubeconfig=$KC get node  | grep -i ready | awk '{print$1}' | xargs kubectl --kubeconfig=$KC get node  -o=jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints}{"\n"}{end}' | grep -iv noschedule | wc -l 2>&1`
 echo "Number of nodes in k8s cluster: $nodeCount"
+logInfo "Number of nodes in k8s cluster: $nodeCount"
 if [ "$nodeCount" -lt 3 ]; then 
   if [ "$PXCENTRAL_MINIK8S" == "true" ]; then
     PX_SINGLE_ETCD_DEPLOY="true"
@@ -1768,6 +1987,7 @@ if [ "$nodeCount" -lt 3 ]; then
     CENTRAL_DEPLOYED_PX="false"
   else
     echo "PX-Central deployments needs minimum 3 worker nodes. found: $nodeCount"
+    logInfo "PX-Central deployments needs minimum 3 worker nodes. found: $nodeCount"
     exit 1
   fi
 else
@@ -1780,6 +2000,7 @@ else
     if [ "$PX_STORE_DEPLOY" == "true" ]; then
       resource_check="false"
       USE_EXISTING_PX="true"
+      PXOPERATORDEPLOYMENT="false"
       CENTRAL_DEPLOYED_PX="false"
     fi
     if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
@@ -1791,24 +2012,31 @@ fi
 
 if [ "$PXCENTRAL_MINIK8S" == "true" ]; then
   echo "MINI Setup: $PXCENTRAL_MINIK8S, BACKUP: $PX_BACKUP_DEPLOY, PXSTORE: $PX_STORE_DEPLOY, LICENSE: $PX_LICENSE_SERVER_DEPLOY, METRICS: $PX_METRICS_DEPLOY, ETCD CLUSTER: $PX_ETCD_DEPLOY, STANDALONE ETCD: $PX_SINGLE_ETCD_DEPLOY, KEYCLOAK: $PXCPROVISIONEDOIDC"
+  logInfo "MINI Setup: $PXCENTRAL_MINIK8S, BACKUP: $PX_BACKUP_DEPLOY, PXSTORE: $PX_STORE_DEPLOY, LICENSE: $PX_LICENSE_SERVER_DEPLOY, METRICS: $PX_METRICS_DEPLOY, ETCD CLUSTER: $PX_ETCD_DEPLOY, STANDALONE ETCD: $PX_SINGLE_ETCD_DEPLOY, KEYCLOAK: $PXCPROVISIONEDOIDC"
   echo ""
 fi
 
 if [ "$resource_check" == "true" ]; then
   echo "PX-Central cluster resource check:"
+  logInfo "PX-Central cluster resource check:"
   resource_check="/tmp/resource_check.py"
+  logInfo "Resource check script: $resource_check"
+  nodesData=`kubectl --kubeconfig=$KC get node  | grep -i ready | awk '{print$1}' | xargs kubectl --kubeconfig=$KC get node  -o=jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints}{"\n"}{end}' | grep -iv noschedule 2>&1`
+  logInfo "K8s cluster worker nodes: $nodesData"
 cat > $resource_check <<- "EOF"
 import os
 import sys
 import subprocess
 
 kubeconfig=sys.argv[1]
-
+nodes_data=sys.argv[2]
 cpu_check_list=[]
 memory_check_list=[]
 try:
-  cmd = "kubectl --kubeconfig=%s get nodes | grep -v NAME | awk '{print $1}'" % kubeconfig
-  output= subprocess.check_output(cmd, shell=True)
+  if not nodes_data:
+    cmd = "kubectl --kubeconfig=%s get nodes | grep -v NAME | awk '{print $1}'" % kubeconfig
+    output= subprocess.check_output(cmd, shell=True)
+  output= nodes_data
   nodes_output = output.decode("utf-8")
   nodes_list = nodes_output.split("\n")
   nodes_count = len(nodes_list)
@@ -1846,14 +2074,17 @@ finally:
 EOF
 
   if [ -f ${resource_check} ]; then
-    status=`python $resource_check $KC`
+    status=`$cmdPython $resource_check $KC $nodesData`
     if [ ${status} = "True" ]; then
       echo "Resource check passed.."
+      logInfo "Resource check passed.."
       echo ""
     else
       echo ""
       echo "Nodes in k8s cluster does not have minimum required  resources..."
       echo "CPU: 4, Memory: 8GB, Drives: 2  needed on each k8s worker node"
+      logInfo "Nodes in k8s cluster does not have minimum required  resources..."
+      logInfo "CPU: 4, Memory: 8GB, Drives: 2  needed on each k8s worker node"
       exit 1
     fi
   fi
@@ -1869,52 +2100,67 @@ pxc_backup_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namesp
 pxc_metrics_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.metrics} 2>&1`
 pxc_sso_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.sso} 2>&1`
 pxc_minik8s_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.minik8s} 2>&1`
-
+logInfo "Existing configuration: PX-Store: $pxc_store_enabled, PX-Backup: $pxc_backup_enabled, PX-Metrics: $pxc_metrics_enabled, PX-SSO: $pxc_sso_enabled, PX-MiniK8s: $pxc_minik8s_enabled"
 if [[ "$PX_STORE_DEPLOY" == "true" && "$pxc_store_enabled" == "false" ]]; then
   if [[ "$pxc_backup_enabled" == "true" || "$pxc_metrics_enabled" == "true" || "$pxc_sso_enabled" == "true" || "$pxc_minik8s_enabled" == "true" ]]; then
     echo ""
     echo "ERROR: Current PX-Central-Onprem cluster already has components running without px-store, px-store cannot be deployed."
+    logInfo "Current PX-Central-Onprem cluster already has components running without px-store, px-store cannot be deployed."
     echo ""
     exit 1
   fi
 fi
 
-kubectl --kubeconfig=$KC create namespace $PXCNAMESPACE &>/dev/null
-kubectl --kubeconfig=$KC create namespace $PX_BACKUP_NAMESPACE &>/dev/null
 if [ "$PXCNAMESPACE" != "$PX_SECRET_NAMESPACE" ]; then
-  kubectl --kubeconfig=$KC create namespace $PX_SECRET_NAMESPACE &>/dev/null
+  kubectl --kubeconfig=$KC create namespace $PX_SECRET_NAMESPACE &> "$LOGFILE"
 fi
 
 if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
-  kubectl --kubeconfig=$KC apply -f $pxc_domain --namespace $PXCNAMESPACE &>/dev/null
+  if [ ! -f $pxc_domain ]; then
+    echo "Failed to create file: $pxc_domain, verify you have right access to create file: $pxc_domain"
+    logError "Failed to create file: $pxc_domain, verify you have right access to create file: $pxc_domain"
+    echo ""
+    exit 1
+  fi
+  logInfo "Creating ingress for px-central services with sub domains using spec: $pxc_domain"
+  kubectl --kubeconfig=$KC apply -f $pxc_domain --namespace $PXCNAMESPACE &> "$LOGFILE"
 fi
 
 if [ "$CLOUD_STORAGE_ENABLED" == "true" ]; then
   if [[ "$AWS_CLOUD_PLATFORM" == "true" || "$AZURE_CLOUD_PLATFORM" == "true" ]]; then
     echo "Cloud platform: $CLOUDPLATFORM, Managed k8s service: $MANAGED_K8S_SERVICE, Disk type: $CLOUD_DATA_DISK_TYPE, Disk size: $CLOUD_DATA_DISK_SIZE"
+    logInfo "Cloud platform: $CLOUDPLATFORM, Managed k8s service: $MANAGED_K8S_SERVICE, Disk type: $CLOUD_DATA_DISK_TYPE, Disk size: $CLOUD_DATA_DISK_SIZE"
     echo ""
   fi
-  if [ "$AWS_CLOUD_PLATFORM" == "true" ]; then
-    kubectl --kubeconfig=$KC create secret generic $CLOUD_SECRET_NAME --from-literal=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID --from-literal=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY --namespace $PXCNAMESPACE &>/dev/null
-  elif [ "$AZURE_CLOUD_PLATFORM" == "true" ]; then
-    kubectl --kubeconfig=$KC create secret generic $CLOUD_SECRET_NAME --from-literal=AZURE_CLIENT_SECRET=$AZURE_CLIENT_SECRET --from-literal=AZURE_CLIENT_ID=$AZURE_CLIENT_ID --from-literal=AZURE_TENANT_ID=$AZURE_TENANT_ID --namespace $PXCNAMESPACE &>/dev/null
-  elif [[ "$VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED" == "true" ]]; then
-    kubectl --kubeconfig=$KC create secret generic $CLOUD_SECRET_NAME --from-literal=VSPHERE_USER=$VSPHERE_USER --from-literal=VSPHERE_PASSWORD=$VSPHERE_PASSWORD --namespace $PXCNAMESPACE &>/dev/null
+  if [ -z ${PX_DISK_PROVISION_SECRET_NAME} ]; then
+    if [ "$AWS_CLOUD_PLATFORM" == "true" ]; then
+      kubectl --kubeconfig=$KC create secret generic $CLOUD_SECRET_NAME --from-literal=AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID --from-literal=AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY --namespace $PXCNAMESPACE &>/dev/null
+    elif [ "$AZURE_CLOUD_PLATFORM" == "true" ]; then
+      kubectl --kubeconfig=$KC create secret generic $CLOUD_SECRET_NAME --from-literal=AZURE_CLIENT_SECRET=$AZURE_CLIENT_SECRET --from-literal=AZURE_CLIENT_ID=$AZURE_CLIENT_ID --from-literal=AZURE_TENANT_ID=$AZURE_TENANT_ID --namespace $PXCNAMESPACE &>/dev/null
+    elif [[ "$VSPHERE_CLUSTER_DISK_PROVISION_REQUIRED" == "true" ]]; then
+      kubectl --kubeconfig=$KC create secret generic $CLOUD_SECRET_NAME --from-literal=VSPHERE_USER=$VSPHERE_USER --from-literal=VSPHERE_PASSWORD=$VSPHERE_PASSWORD --namespace $PXCNAMESPACE &>/dev/null
+    fi
+  else
+    CLOUD_SECRET_NAME=$PX_DISK_PROVISION_SECRET_NAME
   fi
+  logInfo "Cloud portworx disk provision secret name: $CLOUD_SECRET_NAME"
   secretcheck="0"
   timecheck=0
   while [ $secretcheck -ne "1" ]
     do
       cloudSecret=`kubectl --kubeconfig=$KC get secret $CLOUD_SECRET_NAME --namespace $PXCNAMESPACE 2>&1 |  grep -v NAME | grep -v "No resources found" | wc -l 2>&1`
       if [ $cloudSecret -eq "1" ]; then
+        logInfo "Cloud secret: $CLOUD_SECRET_NAME available into namespace: $PXCNAMESPACE"
         secretcheck="1"
         break
       fi
       showMessage "Preparing cloud secret: $CLOUD_SECRET_NAME into namespace: $PXCNAMESPACE"
+      logInfo "Preparing cloud secret: $CLOUD_SECRET_NAME into namespace: $PXCNAMESPACE"
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $LBSERVICETIMEOUT ]; then
           echo ""
           echo "Failed to prepare cloud secret: $CLOUD_SECRET_NAME into namespace: $PXCNAMESPACE for auto disk provision, TIMEOUT: $LBSERVICETIMEOUT"
+          logError "Failed to prepare cloud secret: $CLOUD_SECRET_NAME into namespace: $PXCNAMESPACE for auto disk provision, TIMEOUT: $LBSERVICETIMEOUT"
           echo "Contact: support@portworx.com"
           echo ""
           exit 1
@@ -1939,10 +2185,12 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
         break
       fi
       showMessage "Preparing oidc secret: $KEYCLOAK_BACKEND_SECRET and $KEYCLOAK_FRONTEND_SECRET into namespace: $PXCNAMESPACE"
+      logInfo "Preparing oidc secret: $KEYCLOAK_BACKEND_SECRET and $KEYCLOAK_FRONTEND_SECRET into namespace: $PXCNAMESPACE"
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $LBSERVICETIMEOUT ]; then
           echo ""
           echo "Failed to prepare keycloak secrets: $KEYCLOAK_BACKEND_SECRET and $KEYCLOAK_FRONTEND_SECRET into namespace: $PXCNAMESPACE for OIDC, TIMEOUT: $LBSERVICETIMEOUT"
+          logError "Failed to prepare keycloak secrets: $KEYCLOAK_BACKEND_SECRET and $KEYCLOAK_FRONTEND_SECRET into namespace: $PXCNAMESPACE for OIDC, TIMEOUT: $LBSERVICETIMEOUT"
           echo "Contact: support@portworx.com"
           echo ""
           exit 1
@@ -1953,33 +2201,34 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
   OIDCCLIENTID=$PXC_OIDC_CLIENT_ID
   OIDCSECRET="dummy"
   pxcGrafanaEndpoint="http://pxc-grafana.$PXCNAMESPACE.svc.cluster.local:3000/grafana"
+  logInfo "Grafana default endpoint: $pxcGrafanaEndpoint"
   if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
     OIDCENDPOINT="$PXC_KEYCLOAK/auth"
     EXTERNAL_ENDPOINT_URL=$PXC_FRONTEND
     pxcGrafanaEndpoint=$PXC_GRAFANA
+    logInfo "Domain setup: OIDC Endpoint: $OIDCENDPOINT, External endpoint URL: $EXTERNAL_ENDPOINT_URL, Grafana Endpoint: $pxcGrafanaEndpoint"
   elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
     EXTERNAL_ENDPOINT_URL="$PXENDPOINT"
     pxcGrafanaEndpoint=$PXENDPOINT
+    logInfo "Ingress setup: External endpoint URL: $EXTERNAL_ENDPOINT_URL, Grafana Endpoint: $pxcGrafanaEndpoint"
   else
     OIDCENDPOINT="$PXENDPOINT:$PXC_KEYCLOAK_HTTP_PORT/auth"
     EXTERNAL_ENDPOINT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
     pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
+    logInfo "Public IP setup: OIDC Endpoint: $OIDCENDPOINT, External endpoint URL: $EXTERNAL_ENDPOINT_URL, Grafana Endpoint: $pxcGrafanaEndpoint"
   fi
-fi
-
-if [ "$OIDCENABLED" == "false" ]; then
+else
   EXTERNAL_ENDPOINT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
   pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
   echo "External Endpoint: $EXTERNAL_ENDPOINT_URL"
-elif [[ "$OIDCENABLED" == "true" && "$PXCPROVISIONEDOIDC" == "false" ]]; then
-  EXTERNAL_ENDPOINT_URL="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
-  pxcGrafanaEndpoint="$PXENDPOINT:$PXC_UI_EXTERNAL_PORT"
-  echo "External Endpoint: $EXTERNAL_ENDPOINT_URL"
+  logInfo "External Endpoint: $EXTERNAL_ENDPOINT_URL"
 fi
 
 if [[ "$OIDCENABLED" == "true" &&  "$PX_BACKUP_DEPLOY" == "true" ]]; then
   echo "External Access OIDC Endpoint: $OIDCENDPOINT"
+  logInfo "External Access OIDC Endpoint: $OIDCENDPOINT"
   oidc_endpoint="http://$OIDCENDPOINT/realms/master"
+  logInfo "OIDC Endpoint: $oidc_endpoint"
   kubectl --kubeconfig=$KC create secret generic $BACKUP_OIDC_SECRET_NAME --from-literal=OIDC_CLIENT_ID=$OIDCCLIENTID --from-literal=OIDC_ENDPOINT=$oidc_endpoint --namespace $PXCNAMESPACE &>/dev/null
   backupsecretcheck="0"
   timecheck=0
@@ -1991,10 +2240,12 @@ if [[ "$OIDCENABLED" == "true" &&  "$PX_BACKUP_DEPLOY" == "true" ]]; then
         break
       fi
       showMessage "Preparing oidc secret: $BACKUP_OIDC_SECRET_NAME into namespace: $PXCNAMESPACE"
+      logInfo "Preparing oidc secret: $BACKUP_OIDC_SECRET_NAME into namespace: $PXCNAMESPACE"
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $LBSERVICETIMEOUT ]; then
           echo ""
           echo "Failed to create OIDC secret for PX-Backup: $BACKUP_OIDC_SECRET_NAME into namespace: $PXCNAMESPACE for auto disk provision, TIMEOUT: $LBSERVICETIMEOUT"
+          logInfo "Failed to create OIDC secret for PX-Backup: $BACKUP_OIDC_SECRET_NAME into namespace: $PXCNAMESPACE for auto disk provision, TIMEOUT: $LBSERVICETIMEOUT"
           echo "Contact: support@portworx.com"
           echo ""
           exit 1
@@ -2008,6 +2259,7 @@ if [ $CUSTOMREGISTRYENABLED = "true" ]; then
   validatesecret=`kubectl --kubeconfig=$KC get secret $IMAGEPULLSECRET  --namespace $PXCNAMESPACE 2>&1 | grep -v NAME | grep -v "error" | grep -v "No resources found" | awk '{print $1}' | wc -l 2>&1`
   if [ $validatesecret -ne "1" ]; then
     echo "ERROR: --image-pull-secret provided is not present in $PXCNAMESPACE namespace, please create it in $PXCNAMESPACE namespace and re-run the script"
+    logError "--image-pull-secret provided is not present in $PXCNAMESPACE namespace, please create it in $PXCNAMESPACE namespace and re-run the script"
     exit 1
   fi
 fi
@@ -2021,60 +2273,76 @@ if [ ${OPENSHIFTCLUSTER} ]; then
     ISOPENSHIFTCLUSTER="true"
     if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
       echo "Detected OpenShift system. Adding $PX_BACKUP_SERVICE_ACCOUNT user to privileged scc"
-      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PX_BACKUP_SERVICE_ACCOUNT &>/dev/null
+      logInfo "Detected OpenShift system. Adding $PX_BACKUP_SERVICE_ACCOUNT user to privileged scc"
+      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PX_BACKUP_SERVICE_ACCOUNT >> "$LOGFILE"
       if [ $? -ne 0 ]; then
         echo "failed to add $PX_BACKUP_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+        logError "failed to add $PX_BACKUP_SERVICE_ACCOUNT to privileged scc. exit code: $?"
       fi
     fi
     if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
       echo "Detected OpenShift system. Adding $PX_KEYCLOAK_SERVICE_ACCOUNT user to privileged scc"
-      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PX_KEYCLOAK_SERVICE_ACCOUNT &>/dev/null
+      logInfo "Detected OpenShift system. Adding $PX_KEYCLOAK_SERVICE_ACCOUNT user to privileged scc"
+      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PX_KEYCLOAK_SERVICE_ACCOUNT >> "$LOGFILE"
       if [ $? -ne 0 ]; then
         echo "failed to add $PX_KEYCLOAK_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+        logError "failed to add $PX_KEYCLOAK_SERVICE_ACCOUNT to privileged scc. exit code: $?"
       fi
     fi
     if [ "$PX_STORE_DEPLOY" == "true" ]; then
       echo "Detected OpenShift system. Adding $PXC_PX_SERVICE_ACCOUNT user to privileged scc"
-      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_PX_SERVICE_ACCOUNT &>/dev/null
+      logInfo "Detected OpenShift system. Adding $PXC_PX_SERVICE_ACCOUNT user to privileged scc"
+      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_PX_SERVICE_ACCOUNT >> "$LOGFILE"
       if [ $? -ne 0 ]; then
         echo "failed to add $PXC_PX_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+        logError "failed to add $PXC_PX_SERVICE_ACCOUNT to privileged scc. exit code: $?"
       fi
       echo "Detected OpenShift system. Adding $PXC_PVC_CONTROLLER_SERVICE_ACCOUNT user to privileged scc"
-      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_PVC_CONTROLLER_SERVICE_ACCOUNT &>/dev/null
+      logInfo "Detected OpenShift system. Adding $PXC_PVC_CONTROLLER_SERVICE_ACCOUNT user to privileged scc"
+      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_PVC_CONTROLLER_SERVICE_ACCOUNT >> "$LOGFILE"
       if [ $? -ne 0 ]; then
         echo "failed to add $PXC_PVC_CONTROLLER_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+        logError "failed to add $PXC_PVC_CONTROLLER_SERVICE_ACCOUNT to privileged scc. exit code: $?"
       fi      
     fi
     if [ "$PX_METRICS_DEPLOY" == "true" ]; then
       echo "Detected OpenShift system. Adding $PXC_PROMETHEUS_SERVICE_ACCOUNT user to privileged scc"
-      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_PROMETHEUS_SERVICE_ACCOUNT &>/dev/null
+      logInfo "Detected OpenShift system. Adding $PXC_PROMETHEUS_SERVICE_ACCOUNT user to privileged scc"
+      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_PROMETHEUS_SERVICE_ACCOUNT >> "$LOGFILE"
       if [ $? -ne 0 ]; then
         echo "failed to add $PXC_PROMETHEUS_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+        logError "failed to add $PXC_PROMETHEUS_SERVICE_ACCOUNT to privileged scc. exit code: $?"
       fi
     fi
     if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
       echo "Detected OpenShift system. Adding $PXC_LICENSE_SERVER_SERVICE_ACCOUNT user to privileged scc"
-      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_LICENSE_SERVER_SERVICE_ACCOUNT &>/dev/null
+      logInfo "Detected OpenShift system. Adding $PXC_LICENSE_SERVER_SERVICE_ACCOUNT user to privileged scc"
+      oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_LICENSE_SERVER_SERVICE_ACCOUNT >> "$LOGFILE"
       if [ $? -ne 0 ]; then
         echo "failed to add $PXC_LICENSE_SERVER_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+        logError "failed to add $PXC_LICENSE_SERVER_SERVICE_ACCOUNT to privileged scc. exit code: $?"
       fi
     fi
     echo "Detected OpenShift system. Adding $PXC_INGRESS_CONTROLLER_SERVICE_ACCOUNT user to privileged scc"
-    oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_INGRESS_CONTROLLER_SERVICE_ACCOUNT &>/dev/null
+    logInfo "Detected OpenShift system. Adding $PXC_INGRESS_CONTROLLER_SERVICE_ACCOUNT user to privileged scc"
+    oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_INGRESS_CONTROLLER_SERVICE_ACCOUNT >> "$LOGFILE"
     if [ $? -ne 0 ]; then
       echo "failed to add $PXC_INGRESS_CONTROLLER_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+      logError "failed to add $PXC_INGRESS_CONTROLLER_SERVICE_ACCOUNT to privileged scc. exit code: $?"
     fi
     echo "Detected OpenShift system. Adding $PXC_OPERATOR_SERVICE_ACCOUNT user to privileged scc"
-    oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_OPERATOR_SERVICE_ACCOUNT &>/dev/null
+    logInfo "Detected OpenShift system. Adding $PXC_OPERATOR_SERVICE_ACCOUNT user to privileged scc"
+    oc --kubeconfig=$KC adm policy add-scc-to-user privileged system:serviceaccount:$PXCNAMESPACE:$PXC_OPERATOR_SERVICE_ACCOUNT >> "$LOGFILE"
     if [ $? -ne 0 ]; then
       echo "failed to add $PXC_OPERATOR_SERVICE_ACCOUNT to privileged scc. exit code: $?"
+      logError "failed to add $PXC_OPERATOR_SERVICE_ACCOUNT to privileged scc. exit code: $?"
     fi
   fi
 fi
 
-PXOPERATORDEPLOYMENT="true"
 PXDAEMONSETDEPLOYMENT="false"
 PVC_CONTROLLER_REQUIRED="false"
+STORK_PROVISION_REQUIRED="false"
 if [[ "$PXCENTRAL_PX_APP_SAME_K8S_CLUSTER" == "true" && "$PX_STORE_DEPLOY" == "true" ]]; then
   PXDAEMONSETDEPLOYMENT="true"
   PXOPERATORDEPLOYMENT="false"
@@ -2090,6 +2358,7 @@ if [[ "$PXDAEMONSETDEPLOYMENT" == "true" && "$PXCNAMESPACE" != "$STANDARD_NAMESP
 fi
 
 modules_config="/tmp/pxc-modules.yaml"
+logInfo "Modules spec: $modules_config"
 cat <<< '
 apiVersion: v1
 kind: ConfigMap
@@ -2115,11 +2384,18 @@ daemonset_px=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $P
 operator_px=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.operatorpx} 2>&1`
 metrics_store_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.metrics} 2>&1`
 license_server_enabled=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE -o jsonpath={.data.licenseserver} 2>&1`
+logInfo "Central PX: $central_px, Existing px: $existing_px, Daemonset based portworx: $daemonset_px, Operator based portworx: $operator_px, Metric store: $metrics_store_enabled, License server: $license_server_enabled"
 if [ "$central_px" == "true" ]; then
   existingpx="false"
 fi
 if [ "$existingpx" == "true" ]; then
   central_px="false"
+fi
+if [[ "$USE_EXISTING_PX" == "true" && "$existing_px" == "true" ]]; then
+  echo "Using existing px cluster for PX-Central-Onprem setup"
+  logInfo "Using existing px cluster for PX-Central-Onprem setup"
+  PXDAEMONSETDEPLOYMENT="false"
+  PXOPERATORDEPLOYMENT="false"
 fi
 config_check=`kubectl --kubeconfig=$KC get cm $PXC_MODULES_CONFIG --namespace $PXCNAMESPACE 2>&1 | grep -v "error" | grep -v "NotFound" | grep -v "No resources found" | grep -v NAME | awk '{print $1}' | wc -l 2>&1`
 if [[ "$metrics_store_enabled" == "false" && "$PX_METRICS_DEPLOY" == "true" ]]; then
@@ -2129,11 +2405,18 @@ if [[ "$license_server_enabled" == "false" && "$PX_LICENSE_SERVER_DEPLOY" == "tr
   config_check=0
 fi
 if [ $config_check -eq 0 ]; then
-  kubectl --kubeconfig=$KC apply -f $modules_config --namespace $PXCNAMESPACE &>/dev/null
+  if [ ! -f $modules_config ]; then
+    echo "Failed to create file: $modules_config, verify you have right access to create file: $modules_config"
+    logError "Failed to create file: $modules_config, verify you have right access to create file: $modules_config"
+    echo ""
+    exit 1
+  fi
+  logInfo "Creating modules config using spec: $modules_config"
+  kubectl --kubeconfig=$KC apply -f $modules_config --namespace $PXCNAMESPACE &> "$LOGFILE"
   if [[ "$license_server_enabled" == "false" && "$PX_LICENSE_SERVER_DEPLOY" == "true" ]]; then
-    kubectl --kubeconfig=$KC delete job pxc-pre-setup --namespace $PXCNAMESPACE &>/dev/null
+    kubectl --kubeconfig=$KC delete job pxc-pre-setup --namespace $PXCNAMESPACE >> "$LOGFILE"
     sleep $SLEEPINTERVAL
-    kubectl --kubeconfig=$KC delete job pxc-ls-ha-setup --namespace $PXCNAMESPACE &>/dev/null
+    kubectl --kubeconfig=$KC delete job pxc-ls-ha-setup --namespace $PXCNAMESPACE >> "$LOGFILE"
   fi
 else
   if [[ "$central_px" == "true" && "$daemonset_px" == "true" ]]; then
@@ -2165,8 +2448,27 @@ if [ "$PXCENTRAL_MINIK8S"  == "false" ]; then
   PX_STORE_DEPLOY="true"
 fi
 
+storkPodsCount=`kubectl --kubeconfig=$KC get pods -lname=stork --all-namespaces 2>&1 |  grep -v NAME | grep -v "error" | grep -v "No resources found" | wc -l 2>&1`
+if [[ $storkPodsCount -lt 3  && "$PXDAEMONSETDEPLOYMENT" == "true" ]]; then
+  STORK_PROVISION_REQUIRED="true"
+fi
+logInfo "Operator based portworx deployment: $PXOPERATORDEPLOYMENT"
+logInfo "Daemonset based portworx deployment: $PXDAEMONSETDEPLOYMENT"
+logInfo "Operator unsupported cluster: $OPERATOR_UNSUPPORTED_CLUSTER"
+logInfo "Stork scheduler required: $STORK_SCHEDULER_REQUIRED"
+logInfo "Stork provision required: $STORK_PROVISION_REQUIRED"
+logInfo "PVC Controller required: $PVC_CONTROLLER_REQUIRED"
+logInfo "Openshift cluster: $ISOPENSHIFTCLUSTER"
+logInfo "PX-Central namespace: $PXCNAMESPACE, Portworx cluster name: $PXCPXNAME"
+if [ "$ISCLOUDDEPLOYMENT" == "true" ]; then
+  logInfo "Cloud deployment: $ISCLOUDDEPLOYMENT, $AWS Cloud : $AWS_CLOUD_PLATFORM, GCP: $GOOGLE_CLOUD_PLATFORM, Azure: $AZURE_CLOUD_PLATFORM, IBM: $IBM_CLOUD_PLATFORM, vSphere: $VSPHERE_CLUSTER, PKS: $PKS_CLUSTER_ENABLED"
+  logInfo "Cloud disk provision secret name: $CLOUD_SECRET_NAME"
+  logInfo "Cloud storage enabled: $CLOUD_STORAGE_ENABLED, Disk type: $CLOUD_DATA_DISK_TYPE, Disk size: $CLOUD_DATA_DISK_SIZE"
+  logInfo "EKS cluster: $EKS_CLUSTER_TYPE, GKE Cluster: $GKE_CLUSTER_TYPE, AKS cluster: $AKS_CLUSTER_TYPE"
+fi
 if [ "$ISOPENSHIFTCLUSTER" == "true" ]; then
 prometheus_cluster_role="/tmp/px-prometheus-clusterrole.yaml"
+logInfo "Prometheus cluster role template: $prometheus_cluster_role"
 cat <<< '
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -2188,9 +2490,18 @@ rules:
   - nonResourceURLs: ["/metrics", "/federate"]
     verbs: ["get"]
 ' > $prometheus_cluster_role
-kubectl --kubeconfig=$KC apply -f $prometheus_cluster_role  &>/dev/null
+
+  if [ ! -f $prometheus_cluster_role ]; then
+      echo "Failed to create file: $prometheus_cluster_role, verify you have right access to create file: $prometheus_cluster_role"
+      logError "Failed to create file: $prometheus_cluster_role, verify you have right access to create file: $prometheus_cluster_role"
+      echo ""
+      exit 1
+  fi
+  logInfo "Creating prometheus cluster role using spec: $prometheus_cluster_role"
+  kubectl --kubeconfig=$KC apply -f $prometheus_cluster_role  &> "$LOGFILE"
 fi
 
+logInfo "PX-Central DB template: $PXCDB"
 cat > $PXCDB <<- "EOF"
 -- phpMyAdmin SQL Dump
 -- version 4.7.6
@@ -2235,53 +2546,6 @@ CREATE TABLE `audit_log` (
 -- --------------------------------------------------------
 
 --
--- Table structure for table `aws_clusters`
---
-
-CREATE TABLE `aws_clusters` (
-  `id` int(10) UNSIGNED NOT NULL,
-  `user_id` int(10) UNSIGNED NOT NULL,
-  `company_id` int(10) UNSIGNED NOT NULL,
-  `aws_credential_id` int(10) UNSIGNED NOT NULL,
-  `name` varchar(255) NOT NULL,
-  `instances` int(11) NOT NULL,
-  `region` varchar(50) DEFAULT NULL,
-  `security_group` varchar(255) DEFAULT NULL,
-  `security_group_id` varchar(1024) DEFAULT NULL,
-  `total_used` int(11) DEFAULT NULL,
-  `total_size` int(11) DEFAULT NULL,
-  `cpu` int(11) DEFAULT NULL,
-  `instance_obj` blob,
-  `status` enum('RUNNING','TERMINATED','STOPPED','REBOOT','ERROR','NEW') NOT NULL,
-  `created_at` timestamp NULL DEFAULT NULL,
-  `updated_at` timestamp NULL DEFAULT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8;
-
--- --------------------------------------------------------
-
---
--- Table structure for table `aws_credentials`
---
-
-CREATE TABLE `aws_credentials` (
-  `id` int(10) UNSIGNED NOT NULL,
-  `user_id` int(10) UNSIGNED NOT NULL,
-  `company_id` int(10) UNSIGNED NOT NULL,
-  `aws_key` varchar(255) NOT NULL,
-  `aws_secret` varchar(255) NOT NULL,
-  `name` varchar(255) NOT NULL,
-  `keypair_name` varchar(255) DEFAULT NULL,
-  `group_name` varchar(255) DEFAULT NULL,
-  `ssh_key` varchar(4096) DEFAULT NULL,
-  `region` varchar(20) DEFAULT NULL,
-  `version` varchar(20) DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT NULL,
-  `updated_at` timestamp NULL DEFAULT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8;
-
--- --------------------------------------------------------
-
---
 -- Table structure for table `company`
 --
 
@@ -2314,17 +2578,17 @@ CREATE TABLE `company` (
 INSERT INTO `company` (`id`, `name`, `url`, `sales_contact`, `contact_person_gender`, `contact_person`, `contact_email`, `contact_phone`, `billing_address1`, `billing_address2`, `billing_city`, `billing_state`, `billing_country`, `billing_zip`, `gdpr`, `notes`, `created_by`, `created_at`, `updated_at`) VALUES
 (1, 'UnAssigned', 'https://www.portworx.com', 'None', 'MALE', 'None', 'support@portworx.com', '111-1111', 'None', 'None', 'None', 'None', 'United States', '00000', 0, 'None', 1, '2001-01-01 00:00:00', '2001-01-01 00:00:00');
 
-
 -- --------------------------------------------------------
 
 --
 -- Table structure for table `lh_cluster`
 --
+
 CREATE TABLE `lh_cluster` (
   `id` bigint(20) UNSIGNED NOT NULL,
   `company_id` int(10) UNSIGNED NOT NULL,
   `user_id` int(10) UNSIGNED NOT NULL,
-  `clusteruuid` varchar(80) NOT NULL,
+  `clusteruuid` varchar(80) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT 'Cluster UUID from Portworx',
   `clusterid` varchar(255) NOT NULL,
   `endpoint_active` varchar(255) NOT NULL,
   `endpoint_schema` enum('http','https') NOT NULL,
@@ -2340,12 +2604,15 @@ CREATE TABLE `lh_cluster` (
   `prometheus` varchar(1024) DEFAULT NULL,
   `kibana` varchar(1024) DEFAULT NULL,
   `kube_config` blob,
+  `enabled_px_backup` tinyint(1) NOT NULL DEFAULT '0',
+  `enabled_metrics` tinyint(1) NOT NULL DEFAULT '0',
   `security_type` enum('NONE','TOKEN','OIDC') NOT NULL,
   `token` varchar(5000) DEFAULT NULL,
   `data` varchar(2000) DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   `updated_at` timestamp NULL DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
 
 -- --------------------------------------------------------
 
@@ -2583,20 +2850,6 @@ ALTER TABLE `audit_log`
   ADD PRIMARY KEY (`id`);
 
 --
--- Indexes for table `aws_clusters`
---
-ALTER TABLE `aws_clusters`
-  ADD PRIMARY KEY (`id`),
-  ADD UNIQUE KEY `id` (`id`);
-
---
--- Indexes for table `aws_credentials`
---
-ALTER TABLE `aws_credentials`
-  ADD PRIMARY KEY (`id`),
-  ADD UNIQUE KEY `id` (`id`);
-
---
 -- Indexes for table `company`
 --
 ALTER TABLE `company`
@@ -2681,18 +2934,6 @@ ALTER TABLE `audit_log`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --
--- AUTO_INCREMENT for table `aws_clusters`
---
-ALTER TABLE `aws_clusters`
-  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
-
---
--- AUTO_INCREMENT for table `aws_credentials`
---
-ALTER TABLE `aws_credentials`
-  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
-
---
 -- AUTO_INCREMENT for table `company`
 --
 ALTER TABLE `company`
@@ -2748,6 +2989,8 @@ COMMIT;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 EOF
 
+pxcentral_onprem_crd="/tmp/pxcentralonprem_crd.yaml"
+logInfo "Onprem CRD spec: $pxcentral_onprem_crd"
 cat <<< '
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -2895,6 +3138,8 @@ spec:
     listKind: PxCentralOnpremList
     plural: pxcentralonprems
     singular: pxcentralonprem
+    shortNames:
+    - pxc
   scope: Namespaced
   subresources:
     status: {}
@@ -3008,8 +3253,10 @@ spec:
             - start
         imagePullSecrets:
         - name: '$IMAGEPULLSECRET'
-' > /tmp/pxcentralonprem_crd.yaml
+' > $pxcentral_onprem_crd
 
+pxcentral_onprem_cr="/tmp/pxcentralonprem_cr.yaml"
+logInfo "Onprem CR spec: $pxcentral_onprem_cr"
 cat <<< '
 apiVersion: pxcentral.com/v1alpha1
 kind: PxCentralOnprem
@@ -3022,6 +3269,7 @@ spec:
   nodeAffinityKey: '$NODE_AFFINITY_KEY'
   nodeAffinityValue: '$NODE_AFFINITY_VALUE'
   storkRequired: '$STORK_SCHEDULER_REQUIRED'
+  storkProvisionRequired: '$STORK_PROVISION_REQUIRED'
   portworx:
     pxstore: '$PX_STORE_DEPLOY'
     enabled: '$PXOPERATORDEPLOYMENT'
@@ -3095,6 +3343,10 @@ spec:
   grafanaEndpoint: '$PXC_GRAFANA'
   keycloakEndpoint: '$PXC_KEYCLOAK'
   ingressEndpoint: '$INGRESS_ENDPOINT'
+  proxyForwarding:
+    enabled: '$ENABLE_PROXY_FORWARDING'
+    deployURL: '$PROXY_DEPLOY_URL'
+    image: '$PXC_PROXY_FORWARDING_IMAGE'
   pxcentral:
     enabled: true
     pxcApiServer: '$PXCENTRALAPISERVER'
@@ -3115,6 +3367,9 @@ spec:
         oidcEndpoint: '$OIDCENDPOINT'
       metallb:
         enabled: false
+      pxcentralFrontendImage: '$PX_CENTRAL_FRONTEND'
+      pxcentralBackendImage: '$PX_CENTRAL_BACKEND'
+      pxcentralMiddlewareImage: '$PX_CENTRAL_MIDDLEWARE'
     licenseserver:            # License Server
       enabled: '$PX_LICENSE_SERVER_DEPLOY'
       type:
@@ -3129,9 +3384,10 @@ spec:
       enabled: '$PX_BACKUP_DEPLOY'
       image: '$PXBACKUPIMAGE'
       orgName: '$PX_BACKUP_ORGANIZATION'
-' > /tmp/pxcentralonprem_cr.yaml
+' > $pxcentral_onprem_cr
 
 mac_daemonset="/tmp/pxc-mac-check.yaml"
+logInfo "License server label set based on mac address spec: $mac_daemonset"
 cat <<< '
 apiVersion: v1
 kind: ServiceAccount
@@ -3214,11 +3470,13 @@ spec:
 
 echo "PX-Central cluster deployment started:"
 echo "This process may take several minutes. Please wait for it to complete..."
-
+logInfo "PX-Central cluster deployment started:"
+logInfo "This process may take several minutes. Please wait for it to complete..."
 if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
   pxclicensecm="0"
   main_node_count=`kubectl --kubeconfig=$KC get nodes -lprimary/ls=true 2>&1 | grep Ready | wc -l 2>&1`
   backup_node_count=`kubectl --kubeconfig=$KC get nodes -lbackup/ls=true 2>&1 | grep Ready | wc -l 2>&1`
+  logInfo "Main node count: $main_node_count, Backup node count: $backup_node_count"
   if [[ $main_node_count -eq 1 && $backup_node_count -eq 1 ]]; then
     pxclicensecm="1"
   fi
@@ -3227,32 +3485,56 @@ if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
   count=0
 
   if [ "$pxclicensecm" -eq "0" ]; then
-    kubectl --kubeconfig=$KC apply -f $mac_daemonset &>/dev/null
+    if [ ! -f $mac_daemonset ]; then
+      echo "Failed to create file: $mac_daemonset, verify you have right access to create file: $mac_daemonset"
+      logInfo "Failed to create file: $mac_daemonset, verify you have right access to create file: $mac_daemonset"
+      echo ""
+      exit 1
+    fi
+    logInfo "Creating mac address daemonset for license label set using spec: $mac_daemonset"
+    kubectl --kubeconfig=$KC apply -f $mac_daemonset &> "$LOGFILE"
+    sleep $SLEEPINTERVAL
+    kubectl --kubeconfig=$KC get po -lrun=pxc-mac-setup --namespace $PXCNAMESPACE >> "$LOGFILE"
   fi
 
   while [ $pxclicensecm -ne "1" ]
     do
+      logInfo "License server label set, daemonset pods:"
+      kubectl --kubeconfig=$KC get po -lrun=pxc-mac-setup --namespace $PXCNAMESPACE >> "$LOGFILE"
       pxcentral_license_cm=`kubectl --kubeconfig=$KC get cm --namespace $PXCNAMESPACE 2>&1 | grep -i "pxc-lsc-hasetup" | wc -l 2>&1`
+      if [ "$PXCENTRAL_PX_APP_SAME_K8S_CLUSTER" == "true" ]; then
+        nodeCount=`kubectl --kubeconfig=$KC get nodes -l $NODE_AFFINITY_KEY=true 2>&1 | grep -v NAME | awk '{print $1}' | wc -l 2>&1`
+      fi
       if [ "$pxcentral_license_cm" -eq "$nodeCount" ]; then
         pxclicensecm="1"
         pxclicensecmcreated="1"
         break
       fi
       showMessage "Waiting for PX-Central required components --License-Server-Labels-- to be ready (0/7)"
+      logInfo "Waiting for PX-Central required components --License-Server-Labels-- to be ready (0/7)"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $LBSERVICETIMEOUT ]; then
         echo ""
+        kubectl --kubeconfig=$KC get po -lrun=pxc-mac-setup --namespace $PXCNAMESPACE >> "$LOGFILE"
         echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+        logError "PX-Central deployment is not ready, Contact: support@portworx.com"
         exit 1
       fi
     done
   if [ "$pxclicensecmcreated" -eq "1" ]; then
-    kubectl --kubeconfig=$KC delete -f $mac_daemonset &>/dev/null
+    kubectl --kubeconfig=$KC delete -f $mac_daemonset >> "$LOGFILE"
   fi
 fi
 
-kubectl --kubeconfig=$KC apply -f /tmp/pxcentralonprem_crd.yaml &>/dev/null
+if [ ! -f $pxcentral_onprem_crd ]; then
+  echo "Failed to create file: $pxcentral_onprem_crd, verify you have right access to create file: $pxcentral_onprem_crd"
+  logError "Failed to create file: $pxcentral_onprem_crd, verify you have right access to create file: $pxcentral_onprem_crd"
+  echo ""
+  exit 1
+fi
+logInfo "Creating PX-Central-Onprem CRD using spec: $pxcentral_onprem_crd"
+kubectl --kubeconfig=$KC apply -f $pxcentral_onprem_crd &> "$LOGFILE"
 pxcentralcrdregistered="0"
 timecheck=0
 count=0
@@ -3264,18 +3546,27 @@ while [ $pxcentralcrdregistered -ne "1" ]
       break
     fi
     showMessage "Waiting for PX-Central required components --Central-CRD's-- to be ready (0/7)"
+    logInfo "Waiting for PX-Central required components --Central-CRD's-- to be ready (0/7)"
     sleep $SLEEPINTERVAL
     timecheck=$[$timecheck+$SLEEPINTERVAL]
     if [ $timecheck -gt $TIMEOUT ]; then
       echo ""
       echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+      logError "PX-Central deployment is not ready, Contact: support@portworx.com"
       exit 1
     fi
   done
-
-kubectl --kubeconfig=$KC apply -f /tmp/pxcentralonprem_cr.yaml &>/dev/null
+if [ ! -f $pxcentral_onprem_cr ]; then
+  echo "Failed to create file: $pxcentral_onprem_cr, verify you have right access to create file: $pxcentral_onprem_cr"
+  logError "Failed to create file: $pxcentral_onprem_cr, verify you have right access to create file: $pxcentral_onprem_cr"
+  echo ""
+  exit 1
+fi
+logInfo "Creating PX-Central-Onprem CR using spec: $pxcentral_onprem_cr"
+kubectl --kubeconfig=$KC apply -f $pxcentral_onprem_cr &> "$LOGFILE"
 showMessage "Waiting for PX-Central required components --PX-Central-Operator-- to be ready (0/7)"
-kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE &>/dev/null
+logInfo "Waiting for PX-Central required components --PX-Central-Operator-- to be ready (0/7)"
+kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE >> "$LOGFILE"
 operatordeploymentready="0"
 timecheck=0
 count=0
@@ -3292,20 +3583,26 @@ while [ $operatordeploymentready -ne "1" ]
         break
     fi
     showMessage "Waiting for PX-Central required components --PX-Central-Operator-- to be ready (0/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Operator-- to be ready (0/7)"
+    kubectl --kubeconfig=$KC get po -lname=pxcentral-onprem-operator --namespace $PXCNAMESPACE >> "$LOGFILE"
     sleep $SLEEPINTERVAL
     timecheck=$[$timecheck+$SLEEPINTERVAL]
     if [ $timecheck -gt $TIMEOUT ]; then
       echo ""
       echo "PX-Central onprem deployment not ready... Timeout: $TIMEOUT seconds"
+      logError "PX-Central onprem deployment not ready... Timeout: $TIMEOUT seconds"
       operatorPodName=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "pxcentral-onprem-operator" | awk '{print $1}' | grep -v NAME 2>&1`
+      kubectl --kubeconfig=$KC logs $operatorPodName --namespace $PXCNAMESPACE &> "$LOGFILE"
       echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+      logError "PX-Central deployment is not ready, Contact: support@portworx.com"
       echo ""
       exit 1
     fi
   done
-
+kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE >> "$LOGFILE"
 if [[ "$PX_LICENSE_SERVER_DEPLOY" == "true" || "$PX_STORE_DEPLOY" == "true" ]]; then
   showMessage "Waiting for PX-Central required components --PX-Central-Operator-PX-- to be ready (1/7)"
+  logInfo "Waiting for PX-Central required components --PX-Central-Operator-PX-- to be ready (1/7)"
   pxready="0"
   sleep $SLEEPINTERVAL
   timecheck=0
@@ -3314,12 +3611,22 @@ if [[ "$PX_LICENSE_SERVER_DEPLOY" == "true" || "$PX_STORE_DEPLOY" == "true" ]]; 
   while [ $pxready -ne "1" ]
     do
       if [ "$PX_STORE_DEPLOY" == "true" ]; then
-        pxready=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE -lname=portworx 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
-        if [ $pxready -ge 3 ]; then
+        logInfo "Portworx pods:"
+        if [ "$USE_EXISTING_PX" == "true" ]; then
+          pxPodsReady=`kubectl --kubeconfig=$KC get pods --all-namespaces -lname=portworx 2>&1 | awk '{print $3}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+          kubectl --kubeconfig=$KC get po -lname=portworx --all-namespaces >> "$LOGFILE"
+          pxCSIPodsReady=`kubectl --kubeconfig=$KC get pods --all-namespaces -lname=portworx 2>&1 | awk '{print $3}' | grep -v READY | grep "2/2" | wc -l 2>&1`
+          kubectl --kubeconfig=$KC get po -lname=portworx --all-namespaces >> "$LOGFILE"
+        else
+          pxPodsReady=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE -lname=portworx 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+          kubectl --kubeconfig=$KC get po -lname=portworx --namespace $PXCNAMESPACE &> "$LOGFILE"
+        fi
+        if [[ "$pxPodsReady" -ge "3" || "$pxCSIPodsReady" -ge "3" ]]; then
             pxready="1"
             break
         fi
         showMessage "Waiting for PX-Central required components --PX-Central-Operator-PX-- to be ready (1/7)"
+        logInfo "Waiting for PX-Central required components --PX-Central-Operator-PX-- to be ready (1/7)"
       fi
       if [ "$ISOPENSHIFTCLUSTER" == "true" ]; then
         if [ "$license_server_cm_available" -eq "0" ]; then
@@ -3328,10 +3635,10 @@ if [[ "$PX_LICENSE_SERVER_DEPLOY" == "true" || "$PX_STORE_DEPLOY" == "true" ]]; 
             if [[ ( ! -z "$main_node_ip" ) && ( ! -z "$backup_node_ip" ) ]]; then
               main_node_hostname=`kubectl --kubeconfig=$KC get nodes -o wide | grep "$main_node_ip" | awk '{print $1}' 2>&1`
               backup_node_hostname=`kubectl --kubeconfig=$KC get nodes -o wide | grep "$backup_node_ip" | awk '{print $1}' 2>&1`
-              kubectl --kubeconfig=$KC label node $main_node_hostname px/ls=true &>/dev/null
-              kubectl --kubeconfig=$KC label node $backup_node_hostname px/ls=true &>/dev/null
-              kubectl --kubeconfig=$KC label node $main_node_hostname primary/ls=true &>/dev/null
-              kubectl --kubeconfig=$KC label node $backup_node_hostname backup/ls=true &>/dev/null
+              kubectl --kubeconfig=$KC label node $main_node_hostname px/ls=true &> "$LOGFILE"
+              kubectl --kubeconfig=$KC label node $backup_node_hostname px/ls=true &> "$LOGFILE"
+              kubectl --kubeconfig=$KC label node $main_node_hostname primary/ls=true &> "$LOGFILE"
+              kubectl --kubeconfig=$KC label node $backup_node_hostname backup/ls=true &> "$LOGFILE"
               main_node_count=`kubectl --kubeconfig=$KC get node -lprimary/ls=true | grep Ready | wc -l 2>&1`
               backup_node_count=`kubectl --kubeconfig=$KC get node -lbackup/ls=true | grep Ready | wc -l 2>&1`
               if [[ $main_node_count -eq 1 && $backup_node_count -eq 1 ]]; then
@@ -3352,15 +3659,18 @@ if [[ "$PX_LICENSE_SERVER_DEPLOY" == "true" || "$PX_STORE_DEPLOY" == "true" ]]; 
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
+        operatorPodName=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "pxcentral-onprem-operator" | awk '{print $1}' | grep -v NAME 2>&1`
+        kubectl --kubeconfig=$KC logs $operatorPodName --namespace $PXCNAMESPACE &> "$LOGFILE"
         echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+        logInfo "PX-Central deployment is not ready, Contact: support@portworx.com"
         echo ""
         exit 1
       fi
     done
     if [[ "$PXCENTRAL_PX_APP_SAME_K8S_CLUSTER" == "true" && "$PXCNAMESPACE" != "$STANDARD_NAMESPACE" ]]; then
-      kubectl --kubeconfig=$KC scale deployment --namespace $PXCNAMESPACE portworx-pvc-controller --replicas=0 &>/dev/null
+      kubectl --kubeconfig=$KC scale deployment --namespace $PXCNAMESPACE portworx-pvc-controller --replicas=0 >> "$LOGFILE"
       sleep 5
-      kubectl --kubeconfig=$KC scale deployment --namespace $PXCNAMESPACE portworx-pvc-controller --replicas=3 &>/dev/null
+      kubectl --kubeconfig=$KC scale deployment --namespace $PXCNAMESPACE portworx-pvc-controller --replicas=3 >> "$LOGFILE"
     fi
 fi
 
@@ -3369,6 +3679,7 @@ if [ "$PX_METRICS_DEPLOY" == "true" ]; then
   timecheck=0
   count=0
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Metrics-Store-- to be ready (2/7)"
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Metrics-Store-- to be ready (2/7)"
   while [ $cassandrapxready -ne "1" ]
     do
       pxcassandraready=`kubectl --kubeconfig=$KC get sts --namespace $PXCNAMESPACE pxc-cortex-cassandra 2>&1 | grep -v READY | awk '{print $2}' | grep "3/3" | wc -l 2>&1`
@@ -3383,11 +3694,15 @@ if [ "$PX_METRICS_DEPLOY" == "true" ]; then
         break
       fi
       showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Metrics-Store-- to be ready (2/7)"
+      logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Metrics-Store-- to be ready (2/7)"
+      logInfo "Cortex cassandra pods:"
+      kubectl --kubeconfig=$KC get po -lapp=pxc-cortex-cassandra --namespace $PXCNAMESPACE >> "$LOGFILE"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
         echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+        logError "PX-Central deployment is not ready, Contact: support@portworx.com"
         echo ""
         exit 1
       fi
@@ -3399,6 +3714,7 @@ if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
   timecheck=0
   count=0
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-License-Server-- to be ready (3/7)"
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-License-Server-- to be ready (3/7)"
   while [ $lscready -ne "1" ]
     do
       licenseserverready=`kubectl --kubeconfig=$KC get deployment --namespace $PXCNAMESPACE pxc-license-server 2>&1 | grep -v READY | awk '{print $2}' | grep "2/2" | wc -l 2>&1`
@@ -3413,16 +3729,21 @@ if [ "$PX_LICENSE_SERVER_DEPLOY" == "true" ]; then
         break
       fi
       showMessage "Waiting for PX-Central required components --PX-Central-Onprem-License-Server-- to be ready (3/7)"
+      logInfo "Waiting for PX-Central required components --PX-Central-Onprem-License-Server-- to be ready (3/7)"
+      logInfo "License server pods:"
+      kubectl --kubeconfig=$KC get po -lapp=pxc-license-server --namespace $PXCNAMESPACE >> "$LOGFILE"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
         echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+        logError "PX-Central deployment is not ready, Contact: support@portworx.com"
         echo ""
         exit 1
       fi
     done
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-License-Server-- to be ready (4/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-License-Server-- to be ready (4/7)"
 fi
 
 if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
@@ -3430,40 +3751,45 @@ if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
   keycloakready="0"
   while [ $keycloakready -ne "1" ]
     do
+      logInfo "Keycloak Backend:"
+      kubectl --kubeconfig=$KC get po -lapp=postgresql --namespace $PXCNAMESPACE >> "$LOGFILE"
+      logInfo "Keycloak Frontend:"
+      kubectl --kubeconfig=$KC get po -lapp.kubernetes.io/name=keycloak --namespace $PXCNAMESPACE >> "$LOGFILE"
       oidcready=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE 2>&1 | grep -v NAME | grep -v "error" | grep -v "NotFound" | grep "pxc-keycloak" | awk '{print $2}' | grep "1/1" | wc -l 2>&1`
       if [ $oidcready -eq 2 ]; then
         keycloakready="1"
         break
       fi
       showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
+      logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
         echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+        logError "PX-Central deployment is not ready, Contact: support@portworx.com"
         echo ""
         exit 1
       fi
     done
-    if [ ${CLOUDPLATFORM} ]; then
-      echo ""
-      echo "Cloud platform : $CLOUDPLATFORM, ingress setup required: $INGRESS_SETUP_REQUIRED"
+    keycloakPodName=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lapp.kubernetes.io/name=keycloak 2>&1 | grep -v NAME | awk '{print $1}'`
+    echo "Keycloak pod: $keycloakPodName"
+    logInfo "Keycloak pod: $keycloakPodName"
+    if [ ${keycloakPodName} ]; then
       if [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-        echo "Ingress setup required"
-        if [[ "$CLOUDPLATFORM" == "$GOOGLE_PROVIDER" || "$CLOUDPLATFORM" == "$AZURE_PROVIDER" ]]; then
-          keycloakPodName=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lapp.kubernetes.io/name=keycloak 2>&1 | grep -v NAME | awk '{print $1}'`
-          echo "Keycloak pod: $keycloakPodName"
-          if [ ${keycloakPodName} ]; then
-            kubectl --kubeconfig=$KC exec -it $keycloakPodName --namespace $PXCNAMESPACE -- bash -c "cd /opt/jboss/keycloak/bin/ && ./kcadm.sh config credentials --server http://localhost:8080/keycloak --realm master --user '$KEYCLOAK_FRONTEND_USERNAME' --password '$KEYCLOAK_FRONTEND_PASSWORD' && ./kcadm.sh update realms/master -s sslRequired=NONE"
-            echo "Disabled ssl-required"
-            echo ""
-          fi
-        fi
+        kubectl --kubeconfig=$KC exec -it $keycloakPodName --namespace $PXCNAMESPACE -- bash -c "cd /opt/jboss/keycloak/bin/ && ./kcadm.sh config credentials --server http://localhost:8080/keycloak --realm master --user '$KEYCLOAK_FRONTEND_USERNAME' --password '$KEYCLOAK_FRONTEND_PASSWORD' && ./kcadm.sh update realms/master -s sslRequired=NONE"
+      else
+        kubectl --kubeconfig=$KC exec -it $keycloakPodName --namespace $PXCNAMESPACE -- bash -c "cd /opt/jboss/keycloak/bin/ && ./kcadm.sh config credentials --server http://localhost:8080/auth --realm master --user '$KEYCLOAK_FRONTEND_USERNAME' --password '$KEYCLOAK_FRONTEND_PASSWORD' && ./kcadm.sh update realms/master -s sslRequired=NONE"
       fi
+      echo "Disabled ssl-required"
+      logInfo "Disabled ssl-required"
+      echo ""
     fi
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
     KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
     client_details="/tmp/clients.json"
+    logInfo "Client details template: $client_details"
     curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $client_details
     cid_check="/tmp/clientid.py"
 cat > $cid_check <<- "EOF"
@@ -3484,19 +3810,30 @@ except Exception as ex:
     pass
 print(client_required_id)
 EOF
-
-    admincli_id=`python $cid_check $client_details admin-cli`
+    if [ -f ${cid_check} ]; then 
+      admincli_id=`$cmdPython $cid_check $client_details admin-cli`
+      KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
+      curl -s -X PUT "http://$OIDCENDPOINT/admin/realms/master/clients/$admincli_id" \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
+      --data '{
+        "attributes": {
+            "access.token.lifespan": "31536000"
+        }
+      }'
+    fi    
     KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
-    curl -s -X PUT "http://$OIDCENDPOINT/admin/realms/master/clients/$admincli_id" \
-    -H 'Content-Type: application/json' \
+    curl -s -X PUT "http://$OIDCENDPOINT/admin/realms/master" \
     -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
+    -H 'Content-Type: application/json' \
     --data '{
-	    "attributes": {
-          "access.token.lifespan": "31536000"
-	  }
-   }'
-    
-    KEYCLOAK_TOKEN=`curl -s -d "client_id=admin-cli" -d "username=$KEYCLOAK_FRONTEND_USERNAME" -d "password=$KEYCLOAK_FRONTEND_PASSWORD" -d "grant_type=password" "http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token" | jq ".access_token" | sed 's/\"//g'`
+	    "loginTheme": "portworx"
+    }'
+    if [ "$PUBLIC_ENDPOINT_SETUP_REQUIRED" == "true" ]; then
+      keycloakBaseURL="/auth/realms/master/account"
+    else
+      keycloakBaseURL="/keycloak/realms/master/account"
+    fi
     curl -s -X POST "http://$OIDCENDPOINT/admin/realms/master/clients/" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
@@ -3505,7 +3842,7 @@ EOF
     "name": "${client_account}",
     "rootUrl": '\"http://$OIDCENDPOINT\"',
     "adminUrl": '\"http://$OIDCENDPOINT\"',
-    "baseUrl": "/keycloak/realms/master/account",
+    "baseUrl": '\"$keycloakBaseURL\"',
     "surrogateAuthRequired": false,
     "enabled": true,
     "clientAuthenticatorType": "client-secret",
@@ -3622,10 +3959,12 @@ EOF
         "manage": true,
         "admin": true
     }
-}' &>/dev/null
+}' >> "$LOGFILE"
   echo ""
   echo "OIDC Client: $PXC_OIDC_CLIENT_ID configured."
+  logInfo "OIDC Client: $PXC_OIDC_CLIENT_ID configured."
   client_details="/tmp/clients.json"
+  logInfo "Client details: $client_details"
   curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/" -H 'Content-Type: application/json' -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq "." > $client_details
   cid_check="/tmp/clientid.py"
 cat > $cid_check <<- "EOF"
@@ -3646,24 +3985,29 @@ except Exception as ex:
     pass
 print(client_required_id)
 EOF
-
-  pxcentral_id=`python $cid_check $client_details $PXC_OIDC_CLIENT_ID`
-  PXC_OIDC_CLIENT_SECRET=`curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/$pxcentral_id/client-secret/" -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".value"`
-  echo "OIDC client [$PXC_OIDC_CLIENT_ID] id: $pxcentral_id"
-  echo "OIDC Client ID: $PXC_OIDC_CLIENT_ID"
-  echo "OIDC Client Secret: $PXC_OIDC_CLIENT_SECRET"
-  if [[ -z ${PXC_OIDC_CLIENT_ID} || -z ${PXC_OIDC_CLIENT_SECRET} ]]; then
-    echo ""
-    echo "ERROR: Falied to setup PX-Central-Onprem OIDC."
-    echo "Contact: support@portworx.com"
-    echo ""
-    exit 1
+  if [ -f ${cid_check} ]; then
+    pxcentral_id=`$cmdPython $cid_check $client_details $PXC_OIDC_CLIENT_ID`
+    PXC_OIDC_CLIENT_SECRET=`curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/clients/$pxcentral_id/client-secret/" -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".value"`
+    echo "OIDC client [$PXC_OIDC_CLIENT_ID] id: $pxcentral_id"
+    echo "OIDC Client ID: $PXC_OIDC_CLIENT_ID"
+    echo "OIDC Client Secret: $PXC_OIDC_CLIENT_SECRET"
+    logInfo "OIDC client [$PXC_OIDC_CLIENT_ID] id: $pxcentral_id"
+    logInfo "OIDC Client ID: $PXC_OIDC_CLIENT_ID"
+    logInfo "OIDC Client Secret: $PXC_OIDC_CLIENT_SECRET"
+    if [[ -z ${PXC_OIDC_CLIENT_ID} || -z ${PXC_OIDC_CLIENT_SECRET} ]]; then
+      echo ""
+      echo "ERROR: Failed to setup PX-Central-Onprem OIDC."
+      logError "Failed to setup PX-Central-Onprem OIDC."
+      echo "Contact: support@portworx.com"
+      echo ""
+      exit 1
+    fi
   fi
   pxadmin_user_id=`curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/users/" \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".[].id" | sed 's/\"//g'`
   echo "OIDC Admin user [$KEYCLOAK_FRONTEND_USERNAME] id: $pxadmin_user_id"
-
+  logInfo "OIDC Admin user [$KEYCLOAK_FRONTEND_USERNAME] id: $pxadmin_user_id"
   user_update_status=`curl -s -X PUT "http://$OIDCENDPOINT/admin/realms/master/users/$pxadmin_user_id" \
       -H 'Content-Type: application/json' \
       -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
@@ -3715,7 +4059,7 @@ data:
   APP_DOMAIN: '$PXENDPOINT':'$PXC_UI_EXTERNAL_PORT'/pxcentral
   APP_ENV: local
   APP_KEY: base64:J1RH3W4+CILq3/eac9zqYbAMzeptqCJgR9KcWRdhtHw=
-  APP_LOG: errorlog
+  APP_LOG: stderr
   APP_NAME: Portworx
   BACKEND_HOSTNAME: '$PXENDPOINT':'$PXC_UI_EXTERNAL_PORT'/backend
   FRONTEND_HOSTNAME: '$PXENDPOINT':'$PXC_UI_EXTERNAL_PORT'/pxcentral
@@ -3728,7 +4072,7 @@ data:
   DB_PASSWORD: singapore
   DB_PORT: "3306"
   DB_USERNAME: root
-  LOG_CHANNEL: stack
+  LOG_CHANNEL: stderr
   PX_LICENSE_SERVER: '$license_servers'
   PX_LICENSE_PASSWORD: '$LICENSEADMINPASSWORD'
   PX_LICENSE_USER: admin
@@ -3766,7 +4110,7 @@ data:
   APP_DOMAIN: '$PXC_FRONTEND'
   APP_ENV: local
   APP_KEY: base64:J1RH3W4+CILq3/eac9zqYbAMzeptqCJgR9KcWRdhtHw=
-  APP_LOG: errorlog
+  APP_LOG: stderr
   APP_NAME: Portworx
   BACKEND_HOSTNAME: '$PXC_BACKEND'
   FRONTEND_HOSTNAME: '$PXC_FRONTEND'
@@ -3779,7 +4123,7 @@ data:
   DB_PASSWORD: singapore
   DB_PORT: "3306"
   DB_USERNAME: root
-  LOG_CHANNEL: stack
+  LOG_CHANNEL: stderr
   PX_LICENSE_SERVER: '$license_servers'
   PX_LICENSE_PASSWORD: '$LICENSEADMINPASSWORD'
   PX_LICENSE_USER: admin
@@ -3794,7 +4138,7 @@ data:
   OIDC_REDIRECTURI: http://'$PXC_FRONTEND'/landing/oauth/oidc
 ' > $with_dns_backend_config
 
-with_ingress_backend_config="/tmp/pxc-ui-inngress-configmap.yaml"
+with_ingress_backend_config="/tmp/pxc-ui-ingress-configmap.yaml"
 cat <<< '
 apiVersion: v1
 kind: ConfigMap
@@ -3817,7 +4161,7 @@ data:
   APP_DOMAIN: '$INGRESS_ENDPOINT'/pxcentral
   APP_ENV: local
   APP_KEY: base64:J1RH3W4+CILq3/eac9zqYbAMzeptqCJgR9KcWRdhtHw=
-  APP_LOG: errorlog
+  APP_LOG: stderr
   APP_NAME: Portworx
   BACKEND_HOSTNAME: '$INGRESS_ENDPOINT'/backend
   FRONTEND_HOSTNAME: '$INGRESS_ENDPOINT'/pxcentral
@@ -3830,7 +4174,7 @@ data:
   DB_PASSWORD: singapore
   DB_PORT: "3306"
   DB_USERNAME: root
-  LOG_CHANNEL: stack
+  LOG_CHANNEL: stderr
   PX_LICENSE_SERVER: '$license_servers'
   PX_LICENSE_PASSWORD: '$LICENSEADMINPASSWORD'
   PX_LICENSE_USER: admin
@@ -3846,22 +4190,46 @@ data:
 ' > $with_ingress_backend_config
 
   if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
-    kubectl --kubeconfig=$KC apply -f $with_dns_backend_config --namespace $PXCNAMESPACE &>/dev/null
+    if [ ! -f $with_dns_backend_config ]; then
+      echo "Failed to create file: $with_dns_backend_config, verify you have right access to create file: $with_dns_backend_config"
+      logError "Failed to create file: $with_dns_backend_config, verify you have right access to create file: $with_dns_backend_config"
+      echo ""
+      exit 1
+    fi
+    logInfo "Creating UI configmap using spec: $with_dns_backend_config"
+    kubectl --kubeconfig=$KC apply -f $with_dns_backend_config --namespace $PXCNAMESPACE &> "$LOGFILE"
   elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
-    kubectl --kubeconfig=$KC apply -f $with_ingress_backend_config --namespace $PXCNAMESPACE &>/dev/null
+    if [ ! -f $with_ingress_backend_config ]; then
+      echo "Failed to create file: $with_ingress_backend_config, verify you have right access to create file: $with_ingress_backend_config"
+      logError "Failed to create file: $with_ingress_backend_config, verify you have right access to create file: $with_ingress_backend_config"
+      echo ""
+      exit 1
+    fi
+    logInfo "Creating UI configmap using spec: $with_ingress_backend_config"
+    kubectl --kubeconfig=$KC apply -f $with_ingress_backend_config --namespace $PXCNAMESPACE &> "$LOGFILE"
   else
-    kubectl --kubeconfig=$KC apply -f $backend_config --namespace $PXCNAMESPACE &>/dev/null    
+    if [ ! -f $backend_config ]; then
+      echo "Failed to create file: $backend_config, verify you have right access to create file: $backend_config"
+      logError "Failed to create file: $backend_config, verify you have right access to create file: $backend_config"
+      echo ""
+      exit 1
+    fi
+    logInfo "Creating UI configmap using spec: $backend_config"
+    kubectl --kubeconfig=$KC apply -f $backend_config --namespace $PXCNAMESPACE &> "$LOGFILE"
   fi
 
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
   sleep 10
-  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-backend" 2>&1| grep -v NAME | awk '{print $1}') &>/dev/null
+  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-backend" 2>&1| grep -v NAME | awk '{print $1}') >> "$LOGFILE"
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
-  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-frontend" 2>&1| grep -v NAME | awk '{print $1}') &>/dev/null
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
+  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-frontend" 2>&1| grep -v NAME | awk '{print $1}') >> "$LOGFILE"
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
-  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-lh-middleware" 2>&1| grep -v NAME | awk '{print $1}') &>/dev/null
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
+  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-lh-middleware" 2>&1| grep -v NAME | awk '{print $1}') >> "$LOGFILE"
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
-
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
   if [ "$PX_METRICS_DEPLOY" == "true" ]; then
     grafana_config="/tmp/grafana-ini.yaml"
 cat <<< '
@@ -3899,19 +4267,96 @@ data:
 ' > $grafana_config
 
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
-  kubectl --kubeconfig=$KC apply -f $grafana_config --namespace $PXCNAMESPACE &>/dev/null
-  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-grafana" 2>&1 | grep -v NAME | awk '{print $1}') &>/dev/null
+  if [ ! -f $grafana_config ]; then
+    echo "Failed to create file: $grafana_config, verify you have right access to create file: $grafana_config"
+    logError "Failed to create file: $grafana_config, verify you have right access to create file: $grafana_config"
+    echo ""
+    exit 1
+  fi
+  logInfo "Creating grafana configmap using spec: $grafana_config"
+  kubectl --kubeconfig=$KC apply -f $grafana_config --namespace $PXCNAMESPACE &> "$LOGFILE"
+  kubectl --kubeconfig=$KC delete pod --namespace $PXCNAMESPACE $(kubectl --kubeconfig=$KC get pod --namespace $PXCNAMESPACE 2>&1 | grep "pxc-grafana" 2>&1 | grep -v NAME | awk '{print $1}') >> "$LOGFILE"
   showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
+  logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Keycloak-- to be ready (4/7)"
   fi
 
   OIDC_USER_ACCESS_TOKEN=`curl -s --data "grant_type=password&client_id=$PXC_OIDC_CLIENT_ID&username=$KEYCLOAK_FRONTEND_USERNAME&password=$KEYCLOAK_FRONTEND_PASSWORD&token-duration=$OIDC_USER_AUTH_TOKEN_EXPIARY_DURATION" http://$OIDCENDPOINT/realms/master/protocol/openid-connect/token | jq -r ".access_token"`
   if [ "$OIDC_USER_ACCESS_TOKEN" == "null" ]; then
     echo ""
-    echo "ERROR: Falied to fetch PX-Central-Onprem OIDC admin user access token."
+    echo "ERROR: Failed to fetch PX-Central-Onprem OIDC admin user access token."
+    logError "Failed to fetch PX-Central-Onprem OIDC admin user access token."
     echo "Contact: support@portworx.com"
     echo ""
     exit 1
   fi
+
+  if [ "$EXTERNAL_OIDC_ENABLED" == "true" ]; then
+    logInfo "External OIDC endpoint: $EXTERNAL_OIDCENDPOINT"
+    logInfo "External OIDC client ID: $EXTERNAL_OIDCCLIENTID"
+    logInfo "External OIDC client secret: $EXTERNAL_OIDCSECRET"
+    http_substring='http'
+    if [[ "$EXTERNAL_OIDCENDPOINT" == *"$http_substring"* ]]; then
+      logInfo "No need to update External OIDC endpoint"
+    else
+      EXTERNAL_OIDCENDPOINT="https://$EXTERNAL_OIDCENDPOINT"
+      logInfo "Updated External OIDC endpoint $EXTERNAL_OIDCENDPOIN"
+    fi
+    EXTERNAL_OIDCENDPOINT=$(echo $EXTERNAL_OIDCENDPOINT | sed 's:/*$::')
+    logInfo "Removed end / from External OIDC endpoint: $EXTERNAL_OIDCENDPOINT"
+    authorization_endpoint=`curl -s -X GET "$EXTERNAL_OIDCENDPOINT/.well-known/openid-configuration" --insecure | jq ".authorization_endpoint" | sed 's/\"//g'`
+    token_endpoint=`curl -s -X GET "$EXTERNAL_OIDCENDPOINT/.well-known/openid-configuration" --insecure | jq ".token_endpoint" | sed 's/\"//g'`
+    logout_endpoint=`curl -s -X GET "$EXTERNAL_OIDCENDPOINT/.well-known/openid-configuration" --insecure | jq ".end_session_endpoint" | sed 's/\"//g'`
+    logInfo "Authorization Endpoint: $authorization_endpoint"
+    logInfo "Token Endpoint: $token_endpoint"
+    logInfo "Logout Endpoint: $logout_endpoint"
+    if [ "$logout_endpoint" == "null" ]; then
+      logout_endpoint="$EXTERNAL_OIDCENDPOINT/v2/logout"
+      logInfo "Updated Logout Endpoint: $logout_endpoint"
+    fi
+    curl -s -X POST "http://$OIDCENDPOINT/admin/realms/master/identity-provider/instances" \
+  -H "Authorization: Bearer $KEYCLOAK_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '    {
+        "alias": "oidc",
+        "displayName": "PX-Central-External-OIDC",
+        "internalId": "d4fe10a1-f363-400f-a526-860b909c39d9",
+        "providerId": "oidc",
+        "enabled": true,
+        "updateProfileFirstLoginMode": "on",
+        "trustEmail": false,
+        "storeToken": true,
+        "addReadTokenRoleOnCreate": false,
+        "authenticateByDefault": false,
+        "linkOnly": false,
+        "firstBrokerLoginFlowAlias": "first broker login",
+        "config": {
+          "loginHint": "true",
+          "uiLocales": "true",
+          "clientId": '\"$EXTERNAL_OIDCCLIENTID\"',
+          "tokenUrl": '\"$token_endpoint\"',
+          "clientAuthMethod": "client_secret_post",
+          "authorizationUrl": '\"$authorization_endpoint\"',
+          "logoutUrl": '\"$logout_endpoint\"',
+          "clientSecret": '\"$EXTERNAL_OIDCSECRET\"',
+          "backchannelSupported": "true",
+          "prompt": "login",
+          "useJwksUrl": "true"
+        }
+      }'
+
+      configuredIdentityProviderInstance=`curl -s -X GET "http://$OIDCENDPOINT/admin/realms/master/identity-provider/instances" \
+      -H "Authorization: Bearer $KEYCLOAK_TOKEN" | jq ".[].config.clientId"`
+      logInfo "Identity provider instance: $configuredIdentityProviderInstance"
+      if [ ${configuredIdentityProviderInstance} ]; then
+        echo ""
+        echo  "External OIDC Identity provider configured in PX-Central-Onprem keycloak"
+        logInfo "External OIDC Identity provider configured in PX-Central-Onprem keycloak"
+      else
+        echo ""
+        echo  "Failed to setup external OIDC Identity provider in PX-Central-Onprem keycloak"
+        logInfo "Failed to setup external OIDC Identity provider in PX-Central-Onprem keycloak"
+      fi
+  fi    
 fi
 
 deploymentready="0"
@@ -3931,18 +4376,24 @@ while [ $deploymentready -ne "1" ]
       break
     fi
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Operator-- to be ready (4/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Operator-- to be ready (4/7)"
+    kubectl --kubeconfig=$KC get po -lname=pxcentral-onprem-operator --namespace $PXCNAMESPACE >> "$LOGFILE"
     sleep $SLEEPINTERVAL
     timecheck=$[$timecheck+$SLEEPINTERVAL]
     if [ $timecheck -gt $TIMEOUT ]; then
       operatorPodName=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "pxcentral-onprem-operator" | awk '{print $1}' | grep -v NAME 2>&1`
       echo ""
+      kubectl --kubeconfig=$KC logs $operatorPodName --namespace $PXCNAMESPACE &> "$LOGFILE"
       echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+      logError "PX-Central deployment is not ready, Contact: support@portworx.com"
       echo ""
       exit 1
     fi
   done
 
 showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Operator-- to be ready (5/7)"
+logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Operator-- to be ready (5/7)"
+kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE >> "$LOGFILE"
 if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
   kubectl --kubeconfig=$KC create secret generic $BACKUP_OIDC_ADMIN_SECRET_NAME --from-literal=PX_BACKUP_ORG_TOKEN=$OIDC_USER_ACCESS_TOKEN --namespace $PX_BACKUP_NAMESPACE &>/dev/null
   backupready="0"
@@ -3952,6 +4403,10 @@ if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
     do
       pxcbackupdeploymentready=`kubectl --kubeconfig=$KC get deployment --namespace $PXCNAMESPACE px-backup 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
       pxcbackupdeploymentreadyocp=`kubectl --kubeconfig=$KC get deployment --namespace $PXCNAMESPACE px-backup 2>&1 | awk '{print $3}' | grep -v CURRENT | grep "1" | wc -l 2>&1`
+      logInfo "PX-Backup ETCD pods:"
+      kubectl --kubeconfig=$KC get po -lapp.kubernetes.io/name=etcd --namespace $PXCNAMESPACE &> "$LOGFILE"
+      logInfo "PX-Backup pod:"
+      kubectl --kubeconfig=$KC get po -lapp=px-backup --namespace $PXCNAMESPACE &> "$LOGFILE"
       if [ "$OPENSHIFTCLUSTER" == "true" ]; then
         if [ "$pxcbackupdeploymentreadyocp" -eq "1" ]; then
           backupready="1"
@@ -3962,73 +4417,112 @@ if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
         break
       fi
       showMessage "Waiting for PX-Central required components --PX-Central-Onprem-PX-Backup-- to be ready (5/7)"
+      logInfo "Waiting for PX-Central required components --PX-Central-Onprem-PX-Backup-- to be ready (5/7)"
       sleep $SLEEPINTERVAL
       timecheck=$[$timecheck+$SLEEPINTERVAL]
       if [ $timecheck -gt $TIMEOUT ]; then
         echo ""
         echo "ERROR: PX-Central PX-Backup is not ready, Contact: support@portworx.com"
+        logInfo "PX-Central PX-Backup is not ready, Contact: support@portworx.com"
         echo ""
         exit 1
       fi
     done
-  backup_pod=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE 2>&1 | grep px-backup | awk '{print $1}' 2>&1`
+  backup_pod=`kubectl --kubeconfig=$KC get po -lapp=px-backup --namespace $PXCNAMESPACE 2>&1 | grep px-backup | awk '{print $1}' 2>&1`
+  logInfo "Backup pod name: $backup_pod"
+  orgIDCheck=0
   if [ "$OIDCENABLED" == "false" ]; then
-    kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl create organization --name $PX_BACKUP_ORGANIZATION" &>/dev/null
+    kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl create organization --name $PX_BACKUP_ORGANIZATION"
+    orgIDCheck=`kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl get organization --name $PX_BACKUP_ORGANIZATION" 2>&1 | awk '{print $2}' | grep -v NAME | grep $PX_BACKUP_ORGANIZATION | grep -v "exit code 1" | wc -l 2>&1`
   else
-    kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl create organization --name $PX_BACKUP_ORGANIZATION --authtoken $OIDC_USER_ACCESS_TOKEN" &>/dev/null
+    kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl create organization --name $PX_BACKUP_ORGANIZATION --authtoken $OIDC_USER_ACCESS_TOKEN"
+    orgIDCheck=`kubectl --kubeconfig=$KC exec -it $backup_pod --namespace $PXCNAMESPACE -- bash -c "./pxbackupctl/linux/pxbackupctl get organization --name $PX_BACKUP_ORGANIZATION --authtoken $OIDC_USER_ACCESS_TOKEN" 2>&1 | awk '{print $2}' | grep -v NAME | grep $PX_BACKUP_ORGANIZATION | grep -v "exit code 1" | wc -l 2>&1`
+  fi
+  logInfo "Backup Organization ID check: $orgIDCheck"
+  if [ $orgIDCheck -eq 1 ]; then
+    echo ""
+    echo "PX-Backup organization ID: $PX_BACKUP_ORGANIZATION created successfully."
+    logInfo "PX-Backup organization ID: $PX_BACKUP_ORGANIZATION created successfully."
+  else
+    echo ""
+    echo "ERROR: PX-Central-Onprem failed to create organization ID: $PX_BACKUP_ORGANIZATION for PX-Backup. Contact: support@portworx.com"
+    logError "PX-Central-Onprem failed to create organization ID: $PX_BACKUP_ORGANIZATION for PX-Backup. Contact: support@portworx.com"
+    echo ""
+    exit 1
   fi
 fi
 
+backendready="0"
+timecheck=0
+count=0
+while [ $backendready -ne "1" ]
+  do
+    backend_pod=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-backend" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+    kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lrun=pxc-central-backend &> "$LOGFILE"
+    if [ "$backend_pod" -eq "1" ]; then
+      backendready="1"
+      break
+    fi 
+    showMessage "Waiting for PX-Central required components --PX-Central-Onprem-PX-Backend-- to be ready (5/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-PX-Backend-- to be ready (5/7)"
+    sleep $SLEEPINTERVAL
+    timecheck=$[$timecheck+$SLEEPINTERVAL]
+    if [ $timecheck -gt $TIMEOUT ]; then
+      echo ""
+      echo "ERROR: PX-Central PX-Backend is not ready, Contact: support@portworx.com"
+      logInfo "PX-Central PX-Backend is not ready, Contact: support@portworx.com"
+      echo ""
+      exit 1
+    fi
+  done
 pxcdbready="0"
 POD=$(kubectl --kubeconfig=$KC get pod -l app=pxc-mysql --namespace $PXCNAMESPACE -o jsonpath='{.items[0].metadata.name}' 2>&1);
-mysqlRootPassword="singapore"
 timecheck=0
 count=0
 while [ $pxcdbready -ne "1" ]
   do
-    pxcdbdeploymentready=`kubectl --kubeconfig=$KC get deployment --namespace $PXCNAMESPACE pxc-mysql 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
-    pxcdbdeploymentreadyocp=`kubectl --kubeconfig=$KC get deployment --namespace $PXCNAMESPACE pxc-mysql 2>&1 | awk '{print $3}' | grep -v CURRENT | grep "1" | wc -l 2>&1`
-    if [ "$OPENSHIFTCLUSTER" == "true" ]; then
-      if [ "$pxcdbdeploymentreadyocp" -eq "1" ]; then
-        dbrunning=`kubectl --kubeconfig=$KC exec -it $POD --namespace $PXCNAMESPACE -- /etc/init.d/mysql status 2>&1 | grep "running" | wc -l 2>&1`
-        if [ "$dbrunning" -eq "1" ]; then
-          kubectl --kubeconfig=$KC exec -it $POD --namespace $PXCNAMESPACE -- mysql --host=127.0.0.1 --protocol=TCP -u root -psingapore pxcentral < $PXCDB &>/dev/null
-          pxcdbready="1"
-          break
-        fi
-      fi 
-    elif [ "$pxcdbdeploymentready" -eq "1" ]; then
+    kubectl --kubeconfig=$KC get po -lrun=pxc-mysql --namespace $PXCNAMESPACE &> "$LOGFILE"
+    dbpodready=`kubectl --kubeconfig=$KC get pods -lrun=pxc-mysql --namespace $PXCNAMESPACE 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
+    if [ "$dbpodready" -eq "1" ]; then
       dbrunning=`kubectl --kubeconfig=$KC exec -it $POD --namespace $PXCNAMESPACE -- /etc/init.d/mysql status 2>&1 | grep "running" | wc -l 2>&1`
       if [ "$dbrunning" -eq "1" ]; then
-        kubectl --kubeconfig=$KC exec -it $POD --namespace $PXCNAMESPACE -- mysql --host=127.0.0.1 --protocol=TCP -u root -psingapore pxcentral < $PXCDB &>/dev/null
+        logInfo "PX-Central-DB is ready to accept connections. Starting Initialization.."
+        backendPodName=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lrun=pxc-central-backend 2>&1 | grep -v NAME | awk '{print $1}'`
+        logInfo "PX-Central-Backend pod name: $backendPodName"
+        kubectl --kubeconfig=$KC exec -it $backendPodName --namespace $PXCNAMESPACE -- bash -c "cd /var/www/centralApi/ && /var/www/centralApi/install.sh" &> "$LOGFILE"
         pxcdbready="1"
         break
       fi
     fi
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Cluster-Store-- to be ready (5/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Cluster-Store-- to be ready (5/7)"
     sleep $SLEEPINTERVAL
     timecheck=$[$timecheck+$SLEEPINTERVAL]
     if [ $timecheck -gt $TIMEOUT ]; then
       podName=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "pxc-mysql" | awk '{print $1}' | grep -v NAME 2>&1`
       echo ""
       echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+      logError "PX-Central deployment is not ready, Contact: support@portworx.com"
       echo ""
       exit 1
     fi
   done
 
 showMessage "Waiting for PX-Central required components --PX-Central-Cluster-Store-- to be ready (6/7)"
+logInfo "Waiting for PX-Central required components --PX-Central-Cluster-Store-- to be ready (6/7)"
 postsetupjob="0"
 timecheck=0
 count=0
 while [ $postsetupjob -ne "1" ]
   do
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (6/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (6/7)"
     count=$[$count+1]
     if [ "$count" -eq "1" ]; then
-      kubectl --kubeconfig=$KC delete job pxc-post-setup --namespace $PXCNAMESPACE &>/dev/null
+      kubectl --kubeconfig=$KC delete job pxc-post-setup --namespace $PXCNAMESPACE >> "$LOGFILE"
       sleep 5
     fi
+    kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE | grep "pxc-post-setup" >> "$LOGFILE"
     pxcpostsetupjob=`kubectl --kubeconfig=$KC get jobs --namespace $PXCNAMESPACE pxc-post-setup 2>&1 | awk '{print $2}' | grep -v COMPLETIONS | grep "1/1" | wc -l 2>&1`
     pxcpostsetupjobocp=`kubectl --kubeconfig=$KC get jobs --namespace $PXCNAMESPACE pxc-post-setup 2>&1 | awk '{print $2}' | grep -v SUCCESSFUL | grep "1" | wc -l 2>&1`
     backend=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep -i "pxc-central-backend" | awk '{print $2}' | grep "1/1" | wc -l 2>&1`
@@ -4045,40 +4539,54 @@ while [ $postsetupjob -ne "1" ]
       if [[ "$pxcpostsetupjobocp" -eq "1" && "$backend" -eq "1" && "$frontend" -eq "1" ]]; then
         postsetupjob="1"
         showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (7/7)"
+        logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (7/7)"
         break
       fi
     elif [[ "$pxcpostsetupjob" -eq "1" && "$backend" -eq "1" && "$frontend" -eq "1" ]]; then
       postsetupjob="1"
       showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (7/7)"
+      logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (7/7)"
       break
     fi
     showMessage "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (6/7)"
+    logInfo "Waiting for PX-Central required components --PX-Central-Onprem-Post-Install-Checks-- to be ready (6/7)"
     sleep $SLEEPINTERVAL
     timecheck=$[$timecheck+$SLEEPINTERVAL]
     if [ $timecheck -gt $TIMEOUT ]; then
       echo ""
       echo "ERROR: PX-Central deployment is not ready, Contact: support@portworx.com"
+      logInfo "PX-Central deployment is not ready, Contact: support@portworx.com"
       echo ""
       exit 1
     fi
   done
-
+logInfo "PX-Central configuration jobs:"
+kubectl --kubeconfig=$KC get jobs --namespace $PXCNAMESPACE >> "$LOGFILE"
 echo ""
 echo -e -n "PX-Central cluster deployment complete."
-
+logInfo "PX-Central cluster deployment complete."
 echo ""
 echo ""
 echo "+================================================+"
 echo "SAVE THE FOLLOWING DETAILS FOR FUTURE REFERENCES"
 echo "+================================================+"
+FORWARDING_PROXY_URL=""
 if [ "$DOMAIN_SETUP_REQUIRED" == "true" ]; then
   url="http://$PXC_FRONTEND"
+  FORWARDING_PROXY_URL="http://$PXC_PROXY_FORWARDING/host"
 elif [ "$INGRESS_SETUP_REQUIRED" == "true" ]; then
   url="http://$INGRESS_ENDPOINT/pxcentral"
+  FORWARDING_PROXY_URL="http://$INGRESS_ENDPOINT/proxy/host"
 else
   url="http://$PXENDPOINT:$PXC_UI_EXTERNAL_PORT/pxcentral"
+  FORWARDING_PROXY_URL="http://$PXENDPOINT:$PXC_UI_EXTERNAL_PORT/proxy/host"
 fi
 echo "PX-Central User Interface Access URL : $url"
+logInfo "PX-Central User Interface Access URL : $url"
+if [ "$ENABLE_PROXY_FORWARDING" == "true" ]; then
+  echo "Proxy forwarding enabled on this PX-Central-Onprem cluster. URL: $FORWARDING_PROXY_URL"
+  logInfo "Proxy forwarding enabled on this PX-Central-Onprem cluster. URL: $FORWARDING_PROXY_URL"
+fi
 timecheck=0
 while true
   do
@@ -4088,11 +4596,13 @@ while true
       break
     fi
     showMessage "Validating PX-Central endpoint access."
+    logInfo "Validating PX-Central endpoint access."
     sleep $SLEEPINTERVAL
     timecheck=$[$timecheck+$SLEEPINTERVAL]
     if [ $timecheck -gt $LBSERVICETIMEOUT ]; then
       echo ""
       echo "ERROR: Failed to check PX-Central endpoint accessible, Contact: support@portworx.com"
+      logError "Failed to check PX-Central endpoint accessible, Contact: support@portworx.com"
       echo ""
       break
     fi
@@ -4101,44 +4611,46 @@ echo ""
 echo -e -n ""
 
 if [ "$OIDCENABLED" == "false" ]; then
-  if [[ ( ${ADMINEMAIL} = "pxadmin@portworx.com" ) && ( ${ADMINUSER} = "pxadmin" ) ]]; then
     echo "PX-Central admin user name: $ADMINEMAIL"
     echo "PX-Central admin user password: $ADMINPASSWORD"
+    logInfo "PX-Central admin user name: $ADMINEMAIL"
+    logInfo "PX-Central admin user password: $ADMINPASSWORD"
     echo ""
     if [ "$PX_METRICS_DEPLOY" == "true" ]; then
       echo "PX-Central grafana admin user name: $ADMINEMAIL"
       echo "PX-Central grafana admin user password: $ADMINPASSWORD"
+      logInfo "PX-Central grafana admin user name: $ADMINEMAIL"
+      logInfo "PX-Central grafana admin user password: $ADMINPASSWORD"
     fi
     if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
       echo ""
       echo "PX-Central PX-Backup Organization ID: $PX_BACKUP_ORGANIZATION"
+      logInfo "PX-Central PX-Backup Organization ID: $PX_BACKUP_ORGANIZATION"
     fi
-  else if [ $ADMINUSER == "admin" ]; then
-      echo "PX-Central admin user name: $ADMINEMAIL"
-      echo "PX-Central admin user password: $ADMINPASSWORD"
-      echo ""
-      if [ "$PX_METRICS_DEPLOY" == "true" ]; then
-        echo "PX-Central grafana admin user name: $ADMINUSER"
-        echo "PX-Central grafana admin user password: admin"
-        echo "Note: Change Grafana Admin User Password to '$ADMINPASSWORD' from Grafana"
-      fi
-      if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
-        echo ""
-        echo "PX-Central PX-Backup Organization ID: $PX_BACKUP_ORGANIZATION"
-      fi
-    fi
-  fi
 else
   echo ""
-  echo "OIDC enabled, Use OIDC user credentials to access PX-Central UI."
   if [ "$PX_BACKUP_DEPLOY" == "true" ]; then
     echo "PX-Central PX-Backup Organization ID: $PX_BACKUP_ORGANIZATION"
+    logInfo "PX-Central PX-Backup Organization ID: $PX_BACKUP_ORGANIZATION"
   fi
   if [ "$PXCPROVISIONEDOIDC" == "true" ]; then
     echo "Keycloak Endpoint: http://$OIDCENDPOINT"
     echo "Keycloak admin user: $KEYCLOAK_FRONTEND_USERNAME"
     echo "Keycloak admin password: $KEYCLOAK_FRONTEND_PASSWORD"
     echo "OIDC CLIENT ID: $PXC_OIDC_CLIENT_ID, OIDC CLIENT SECRET: $PXC_OIDC_CLIENT_SECRET, OIDC ENDPOINT: $OIDCENDPOINT"
+    logInfo "Keycloak Endpoint: http://$OIDCENDPOINT"
+    logInfo "Keycloak admin user: $KEYCLOAK_FRONTEND_USERNAME"
+    logInfo "Keycloak admin password: $KEYCLOAK_FRONTEND_PASSWORD"
+    logInfo "OIDC CLIENT ID: $PXC_OIDC_CLIENT_ID, OIDC CLIENT SECRET: $PXC_OIDC_CLIENT_SECRET, OIDC ENDPOINT: $OIDCENDPOINT"
+    if [ "$EXTERNAL_OIDC_ENABLED" == "true" ]; then
+      echo ""
+      CALLBACK_URL="http://$OIDCENDPOINT/realms/master/broker/oidc/endpoint"
+      DOC_URL="https://docs.portworx.com/portworx-install-with-kubernetes/operate-and-maintain-on-kubernetes/pxcentral-onprem/set-up-login-redirects/"
+      echo "Configure following endpoint as login redirect/callback URL in External OIDC provider: $CALLBACK_URL"
+      echo "Please, refer doc url: $DOC_URL"
+      logInfo "Configure following endpoint as login redirect/callback URL in External OIDC provider: $CALLBACK_URL"
+      logInfo "Please, refer doc url: $DOC_URL"
+    fi
   fi
 fi
 echo "+================================================+"
@@ -4146,4 +4658,7 @@ echo ""
 
 central_deployment_time=$((($(date +%s)-$start_time)/60))
 echo "PX-Central-Onprem cluster deployment time taken: $central_deployment_time minutes."
+logInfo "PX-Central-Onprem cluster deployment time taken: $central_deployment_time minutes."
+logInfo "===========PX-Central-Onprem Installation Done============"
+logInfo "+================================================+"
 echo ""
