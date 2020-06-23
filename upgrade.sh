@@ -130,6 +130,8 @@ function showMessage() {
 start_time=`date +%s`
 logInfo "+================================================+"
 logInfo "===========PX-Central-Onprem Upgrade Started============"
+echo ""
+echo "Upgrade script logs will be available here: $LOGFILE"
 if [ -z ${PXCNAMESPACE} ]; then
   PXCNAMESPACE=$PXCNAMESPACE_DEFAULT
 fi
@@ -156,17 +158,17 @@ checkK8sVersion=`kubectl --kubeconfig=$KC version --short | awk -Fv '/Server Ver
 echo "Kubernetes cluster version: $checkK8sVersion"
 logInfo "Kubernetes cluster version: $checkK8sVersion"
 if [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" == "1.0.2" ]; then
-  kubectl --kubeconfig=$KC patch cm --namespace $PXCNAMESPACE pxc-central-ui-configmap --type merge -p '{"data":{"APP_LOG": "errorlog"}}' &> "$LOGFILE"
-  kubectl --kubeconfig=$KC patch cm --namespace $PXCNAMESPACE pxc-central-ui-configmap --type merge -p '{"data":{"LOG_CHANNEL": "errorlog"}}' &> "$LOGFILE"
+  kubectl --kubeconfig=$KC patch cm --namespace $PXCNAMESPACE pxc-central-ui-configmap --type merge -p '{"data":{"APP_LOG": "errorlog"}}' >> "$LOGFILE"
+  kubectl --kubeconfig=$KC patch cm --namespace $PXCNAMESPACE pxc-central-ui-configmap --type merge -p '{"data":{"LOG_CHANNEL": "errorlog"}}' >> "$LOGFILE"
   
-  kubectl --kubeconfig=$KC set image deployment/$PXC_BACKUP_DEPLOYMENT_NAME px-backup=$PXCENTRAL_IMAGE_REPO/$PXC_BACKUP_IMAGE --namespace $PXCNAMESPACE &> "$LOGFILE"
+  kubectl --kubeconfig=$KC set image deployment/$PXC_BACKUP_DEPLOYMENT_NAME px-backup=$PXCENTRAL_IMAGE_REPO/$PXC_BACKUP_IMAGE --namespace $PXCNAMESPACE >> "$LOGFILE"
   logInfo "Set the PX-Backup image: $PXCENTRAL_IMAGE_REPO/$PXC_BACKUP_IMAGE"
   backupdeploymentready="0"
   timecheck=0
   count=0
   while [ $backupdeploymentready -ne "1" ]
     do
-      kubectl --kubeconfig=$KC get po -lapp=px-backup --namespace $PXCNAMESPACE &> "$LOGFILE"
+      kubectl --kubeconfig=$KC get po -lapp=px-backup --namespace $PXCNAMESPACE >> "$LOGFILE"
       backuppodready=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep -v "Terminating" | grep -v "ContainerCreating" | grep "$PXC_BACKUP_DEPLOYMENT_NAME" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
       if [ "$backuppodready" -eq "1" ]; then
           backupdeploymentready="1"
@@ -188,14 +190,14 @@ if [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" == "1.0.2" ]; then
       fi
     done
 fi
-kubectl --kubeconfig=$KC set image deployment/$PXC_BACKEND_DEPLOYMENT_NAME px-central-backend=$PXCENTRAL_IMAGE_REPO/$PXC_BACKEND_IMAGE --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC set image deployment/$PXC_BACKEND_DEPLOYMENT_NAME px-central-backend=$PXCENTRAL_IMAGE_REPO/$PXC_BACKEND_IMAGE --namespace $PXCNAMESPACE >> "$LOGFILE"
 logInfo "Set the PX-Central-Backend image: $PXCENTRAL_IMAGE_REPO/$PXC_BACKEND_IMAGE"
 backenddeploymentready="0"
 timecheck=0
 count=0
 while [ $backenddeploymentready -ne "1" ]
   do
-    kubectl --kubeconfig=$KC get po -lrun=pxc-central-backend --namespace $PXCNAMESPACE &> "$LOGFILE"
+    kubectl --kubeconfig=$KC get po -lrun=pxc-central-backend --namespace $PXCNAMESPACE >> "$LOGFILE"
     backuppodready=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep -v "Terminating" | grep -v "ContainerCreating" | grep "$PXC_BACKEND_DEPLOYMENT_NAME" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
     if [ "$backuppodready" -eq "1" ]; then
         backenddeploymentready="1"
@@ -215,14 +217,14 @@ while [ $backenddeploymentready -ne "1" ]
       exit 1
     fi
   done
-kubectl --kubeconfig=$KC set image deployment/$PXC_API_SERVER_DEPLOYMENT_NAME pxc-apiserver=$PXCENTRAL_IMAGE_REPO/$PXC_API_SERVER_IMAGE --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC set image deployment/$PXC_API_SERVER_DEPLOYMENT_NAME pxc-apiserver=$PXCENTRAL_IMAGE_REPO/$PXC_API_SERVER_IMAGE --namespace $PXCNAMESPACE >> "$LOGFILE"
 logInfo "Set the PX-API-Server image: $PXCENTRAL_IMAGE_REPO/$PXC_API_SERVER_IMAGE"
 apiserverdeploymentready="0"
 timecheck=0
 count=0
 while [ $apiserverdeploymentready -ne "1" ]
   do
-    kubectl --kubeconfig=$KC get po -lapp=pxc-apiserver --namespace $PXCNAMESPACE &> "$LOGFILE"
+    kubectl --kubeconfig=$KC get po -lapp=pxc-apiserver --namespace $PXCNAMESPACE >> "$LOGFILE"
     apiserverpodready=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep -v "Terminating" | grep -v "ContainerCreating" | grep "$PXC_API_SERVER_DEPLOYMENT_NAME" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
     if [ "$apiserverpodready" -eq "1" ]; then
         apiserverdeploymentready="1"
@@ -243,14 +245,14 @@ while [ $apiserverdeploymentready -ne "1" ]
       exit 1
     fi
   done
-kubectl --kubeconfig=$KC set image deployment/$PXC_FRONTEND_DEPLOYMENT_NAME px-central-frontend=$PXCENTRAL_IMAGE_REPO/$PXC_FRONTEND_IMAGE --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC set image deployment/$PXC_FRONTEND_DEPLOYMENT_NAME px-central-frontend=$PXCENTRAL_IMAGE_REPO/$PXC_FRONTEND_IMAGE --namespace $PXCNAMESPACE >> "$LOGFILE"
 logInfo "Set the PX-Central-Frontend image: $PXCENTRAL_IMAGE_REPO/$PXC_FRONTEND_IMAGE"
 frontenddeploymentready="0"
 timecheck=0
 count=0
 while [ $frontenddeploymentready -ne "1" ]
   do
-    kubectl --kubeconfig=$KC get po -lrun=pxc-central-frontend --namespace $PXCNAMESPACE &> "$LOGFILE"
+    kubectl --kubeconfig=$KC get po -lrun=pxc-central-frontend --namespace $PXCNAMESPACE >> "$LOGFILE"
     frontendpodready=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep -v "Terminating" | grep -v "ContainerCreating" | grep "$PXC_FRONTEND_DEPLOYMENT_NAME" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
     if [ "$frontendpodready" -eq "1" ]; then
         frontenddeploymentready="1"
@@ -278,7 +280,7 @@ count=0
 while [ $backendready -ne "1" ]
   do
     backend_pod=`kubectl --kubeconfig=$KC get pods --namespace $PXCNAMESPACE 2>&1 | grep "pxc-central-backend" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
-    kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lrun=pxc-central-backend &> "$LOGFILE"
+    kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lrun=pxc-central-backend >> "$LOGFILE"
     if [ "$backend_pod" -eq "1" ]; then
       backendready="1"
       break
@@ -302,7 +304,7 @@ timecheck=0
 count=0
 while [ $pxcdbready -ne "1" ]
   do
-    kubectl --kubeconfig=$KC get po -lrun=pxc-mysql --namespace $PXCNAMESPACE &> "$LOGFILE"
+    kubectl --kubeconfig=$KC get po -lrun=pxc-mysql --namespace $PXCNAMESPACE >> "$LOGFILE"
     dbpodready=`kubectl --kubeconfig=$KC get pods -lrun=pxc-mysql --namespace $PXCNAMESPACE 2>&1 | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
     if [ "$dbpodready" -eq "1" ]; then
       dbrunning=`kubectl --kubeconfig=$KC exec -it $POD --namespace $PXCNAMESPACE -- /etc/init.d/mysql status 2>&1 | grep "running" | wc -l 2>&1`
@@ -310,7 +312,7 @@ while [ $pxcdbready -ne "1" ]
         logInfo "PX-Central-DB is ready to accept connections. Starting Initialization.."
         backendPodName=`kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE -lrun=pxc-central-backend 2>&1 | grep -v NAME | awk '{print $1}'`
         logInfo "PX-Central-Backend pod name: $backendPodName"
-        kubectl --kubeconfig=$KC exec -it $backendPodName --namespace $PXCNAMESPACE -- bash -c "cd /var/www/centralApi/ && /var/www/centralApi/upgrade.sh" &> "$LOGFILE"
+        kubectl --kubeconfig=$KC exec -it $backendPodName --namespace $PXCNAMESPACE -- bash -c "cd /var/www/centralApi/ && /var/www/centralApi/upgrade.sh" >> "$LOGFILE"
         pxcdbready="1"
         break
       fi
@@ -328,14 +330,14 @@ while [ $pxcdbready -ne "1" ]
     fi
   done
 logInfo "PX-Central-Onprem-Cluster-Store updated successfully.."
-kubectl --kubeconfig=$KC set image deployment/$PXC_MIDDLEWARE_DEPLOYMENT_NAME pxc-lighthouse-backend=$PXCENTRAL_IMAGE_REPO/$PXC_MIDDLEWARE_IMAGE --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC set image deployment/$PXC_MIDDLEWARE_DEPLOYMENT_NAME pxc-lighthouse-backend=$PXCENTRAL_IMAGE_REPO/$PXC_MIDDLEWARE_IMAGE --namespace $PXCNAMESPACE >> "$LOGFILE"
 logInfo "Set the PX-Central-Middleware image: $PXCENTRAL_IMAGE_REPO/$PXC_MIDDLEWARE_IMAGE"
 middlewaredeploymentready="0"
 timecheck=0
 count=0
 while [ $middlewaredeploymentready -ne "1" ]
   do
-    kubectl --kubeconfig=$KC get po -lrun=pxc-central-lh-middleware --namespace $PXCNAMESPACE &> "$LOGFILE"
+    kubectl --kubeconfig=$KC get po -lrun=pxc-central-lh-middleware --namespace $PXCNAMESPACE >> "$LOGFILE"
     middlewarepodready=`kubectl --kubeconfig=$KC get pods -lrun=pxc-central-lh-middleware --namespace $PXCNAMESPACE 2>&1 | grep -v "Terminating" | grep -v "ContainerCreating" | awk '{print $2}' | grep -v READY | grep "1/1" | wc -l 2>&1`
     if [ "$middlewarepodready" -eq "1" ]; then
         middlewaredeploymentready="1"

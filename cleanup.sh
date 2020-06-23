@@ -66,6 +66,8 @@ logWarning() {
 start_time=`date +%s`
 logInfo "+================================================+"
 logInfo "===========PX-Central-Onprem Cleanup Started============"
+echo ""
+echo "Cleanup script logs will be available here: $LOGFILE"
 if [ -z ${PXCNAMESPACE} ]; then
   PXCNAMESPACE=$PXCNAMESPACE_DEFAULT
 fi
@@ -311,11 +313,11 @@ sleep $SLEEPINTERVAL
 kubectl --kubeconfig=$KC get ns | grep "$PXCNAMESPACE" >> "$LOGFILE"
 kubectl --kubeconfig=$KC get ns | grep "$PX_BACKUP_NAMESPACE" >> "$LOGFILE"
 logInfo "After cleanup pods list:"
-kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC get po --namespace $PXCNAMESPACE >> "$LOGFILE"
 logInfo "After cleanup services list:"
-kubectl --kubeconfig=$KC get svc --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC get svc --namespace $PXCNAMESPACE >> "$LOGFILE"
 logInfo "After cleanup pvc's list:"
-kubectl --kubeconfig=$KC get pvc --namespace $PXCNAMESPACE &> "$LOGFILE"
+kubectl --kubeconfig=$KC get pvc --namespace $PXCNAMESPACE >> "$LOGFILE"
 echo "PX-Central cluster successfully wiped."
 logInfo "PX-Central cluster successfully wiped."
 echo ""
