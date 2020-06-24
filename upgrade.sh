@@ -20,10 +20,10 @@ Examples:
     ./upgrade.sh --pxcentral-namespace kube-system
 
     # Upgrade PX-Central to specific version 
-    ./upgrade.sh --pxcentral-upgrade-version 1.0.2
+    ./upgrade.sh --pxcentral-upgrade-version 1.0.3
 
     # Upgrade PX-Central to specific version running into air-gapped env with different image repo
-    ./upgrade.sh --pxcentral-upgrade-version 1.0.2 --pxcentral-image-repo docker.portworx.com/portworx
+    ./upgrade.sh --pxcentral-upgrade-version 1.0.3 --pxcentral-image-repo docker.portworx.com/portworx
 
 EOEG
 exit 1
@@ -59,7 +59,7 @@ PXC_FRONTEND_DEPLOYMENT_NAME="pxc-central-frontend"
 PXC_BACKEND_DEPLOYMENT_NAME="pxc-central-backend"
 PXC_MIDDLEWARE_DEPLOYMENT_NAME="pxc-central-lh-middleware"
 PXC_API_SERVER_DEPLOYMENT_NAME="pxc-apiserver"
-PXCENTRAL_ONPREM_UPGRADE_VERSION_DEFAULT="1.0.2"
+PXCENTRAL_ONPREM_UPGRADE_VERSION_DEFAULT="1.0.3"
 
 if [ -z ${PXCENTRAL_IMAGE_REPO} ]; then
     PXCENTRAL_IMAGE_REPO=$PXCENTRAL_IMAGE_REPO_DEFAULT
@@ -67,7 +67,14 @@ fi
 if [ -z ${PXCENTRAL_ONPREM_UPGRADE_VERSION} ]; then
     PXCENTRAL_ONPREM_UPGRADE_VERSION=$PXCENTRAL_ONPREM_UPGRADE_VERSION_DEFAULT
 fi
-if [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" == "1.0.2" ]; then
+if [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" == "1.0.3" ]; then
+    PXC_ONPREM_UPGRADE_VERSION="1.0.3"
+    PXC_API_SERVER_IMAGE="pxcentral-onprem-api:1.0.3"
+    PXC_BACKUP_IMAGE="px-backup:1.0.1"
+    PXC_FRONTEND_IMAGE="pxcentral-onprem-ui-frontend:1.1.1"
+    PXC_BACKEND_IMAGE="pxcentral-onprem-ui-backend:1.1.1"
+    PXC_MIDDLEWARE_IMAGE="pxcentral-onprem-ui-lhbackend:1.1.1"
+elif [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" == "1.0.2" ]; then
     PXC_ONPREM_UPGRADE_VERSION="1.0.2"
     PXC_API_SERVER_IMAGE="pxcentral-onprem-api:1.0.2"
     PXC_BACKUP_IMAGE="px-backup:1.0.1"
@@ -135,13 +142,15 @@ echo "Upgrade script logs will be available here: $LOGFILE"
 if [ -z ${PXCNAMESPACE} ]; then
   PXCNAMESPACE=$PXCNAMESPACE_DEFAULT
 fi
+echo "PX-Central-Onprem namespace: $PXCNAMESPACE"
+echo "Note: Provide the correct namespace where px-central-onprem is running, default namespace is: portworx"
 logInfo "PX-Central-Onprem namespace: $PXCNAMESPACE"
 logInfo "PX-Central-Onprem upgrade version request : $PXCENTRAL_ONPREM_UPGRADE_VERSION"
-if [[ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" != "1.0.1" && "$PXCENTRAL_ONPREM_UPGRADE_VERSION" != "1.0.2" ]]; then
+if [[ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" != "1.0.1" && "$PXCENTRAL_ONPREM_UPGRADE_VERSION" != "1.0.2" && "$PXCENTRAL_ONPREM_UPGRADE_VERSION" != "1.0.3" ]]; then
   echo ""
-  echo "ERROR: Latest stable PX-Central-Onprem version is: 1.0.2 and supported upgrade versions are 1.0.1 and 1.0.2"
+  echo "ERROR: Latest stable PX-Central-Onprem version is: 1.0.3 and supported upgrade versions are 1.0.1, 1.0.2 and 1.0.3"
   echo ""
-  logInfo "Latest stable PX-Central-Onprem version is: 1.0.2 and supported upgrade versions are 1.0.1 and 1.0.2"
+  logInfo "Latest stable PX-Central-Onprem version is: 1.0.3 and supported upgrade versions are 1.0.1, 1.0.2 and 1.0.3"
   exit 1
 fi
 if [ -z ${KC} ]; then
@@ -157,7 +166,7 @@ logInfo "Using Kubeconfig: $KC"
 checkK8sVersion=`kubectl --kubeconfig=$KC version --short | awk -Fv '/Server Version: / {print $3}' 2>&1`
 echo "Kubernetes cluster version: $checkK8sVersion"
 logInfo "Kubernetes cluster version: $checkK8sVersion"
-if [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" == "1.0.2" ]; then
+if [ "$PXCENTRAL_ONPREM_UPGRADE_VERSION" != "1.0.1" ]; then
   kubectl --kubeconfig=$KC patch cm --namespace $PXCNAMESPACE pxc-central-ui-configmap --type merge -p '{"data":{"APP_LOG": "errorlog"}}' >> "$LOGFILE"
   kubectl --kubeconfig=$KC patch cm --namespace $PXCNAMESPACE pxc-central-ui-configmap --type merge -p '{"data":{"LOG_CHANNEL": "errorlog"}}' >> "$LOGFILE"
   
